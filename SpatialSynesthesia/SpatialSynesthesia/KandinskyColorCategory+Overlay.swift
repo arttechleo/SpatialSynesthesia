@@ -24,33 +24,45 @@ extension KandinskyColorCategory {
         }
     }
 
-    /// Strong passthrough multiply tint for “which color family am I looking at?” (not the painting’s literal hex).
+    /// Stage / party-light hues for passthrough color grade (Severance-style), not painting-matched tones.
     var vividTintColor: UIColor {
         switch self {
-        case .red: return UIColor(hex: "#CC0000")!
-        case .yellow: return UIColor(hex: "#FFD700")!
-        case .blue: return UIColor(hex: "#1A4A8C")!
-        case .green: return UIColor(hex: "#1A6B3C")!
-        case .violet: return UIColor(hex: "#5B0DAD")!
-        case .orange: return UIColor(hex: "#E65C00")!
-        case .gray: return UIColor(hex: "#888888")!
-        case .white: return UIColor(hex: "#E8E0D0")!
-        case .black: return UIColor(hex: "#1A1A1A")!
-        case .brown: return UIColor(hex: "#6D4C41")!
+        case .red:
+            return UIColor(red: 1.00, green: 0.00, blue: 0.05, alpha: 1)
+        case .yellow:
+            return UIColor(red: 1.00, green: 0.92, blue: 0.00, alpha: 1)
+        case .blue:
+            return UIColor(red: 0.00, green: 0.20, blue: 1.00, alpha: 1)
+        case .green:
+            return UIColor(red: 0.00, green: 0.85, blue: 0.10, alpha: 1)
+        case .violet:
+            return UIColor(red: 0.55, green: 0.00, blue: 1.00, alpha: 1)
+        case .orange:
+            return UIColor(red: 1.00, green: 0.45, blue: 0.00, alpha: 1)
+        case .gray:
+            return UIColor(red: 0.70, green: 0.72, blue: 0.75, alpha: 1)
+        case .white:
+            return UIColor(red: 1.00, green: 0.95, blue: 0.80, alpha: 1)
+        case .black:
+            return UIColor(red: 0.05, green: 0.05, blue: 0.08, alpha: 1)
+        case .brown:
+            return UIColor(red: 0.78, green: 0.38, blue: 0.05, alpha: 1)
         }
     }
 
-    /// Base cap for multiply blend; combined with `tintIntensityMultiplier` in the passthrough path.
+    /// Drives how strongly the passthrough grade reads (paired with `applyPassthroughColorGrade`).
     var tintIntensity: Float {
         switch self {
-        case .red, .yellow, .blue, .green, .violet, .orange:
-            return 0.55
-        case .gray, .white:
-            return 0.22
-        case .black:
-            return 0.35
-        case .brown:
-            return 0.55
+        case .red:    return 0.82
+        case .yellow: return 0.78
+        case .blue:   return 0.80
+        case .green:  return 0.80
+        case .violet: return 0.82
+        case .orange: return 0.75
+        case .gray:   return 0.30
+        case .white:  return 0.20
+        case .black:  return 0.60
+        case .brown:  return 0.72
         }
     }
 
@@ -98,4 +110,3 @@ extension KandinskyColorCategory {
         overlayTint.withAlphaComponent(alpha)
     }
 }
-

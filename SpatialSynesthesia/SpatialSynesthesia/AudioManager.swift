@@ -13,6 +13,13 @@ import Foundation
 private func spatialSynesthesiaDebugLog(_ message: String) {
     print("[SpatialSynesthesia] \(message)")
 }
+
+private func audioGateDebugLog(_ message: @autoclosure () -> String) {
+    print(message())
+}
+#else
+@inline(__always)
+private func audioGateDebugLog(_ message: @autoclosure () -> String) {}
 #endif
 
 @MainActor
@@ -322,7 +329,7 @@ final class AudioManager: NSObject, AVAudioPlayerDelegate {
             case .focused(let r): return "focused(\(r.name))"
             }
         }()
-        print(
+        audioGateDebugLog(
             "[AudioEntry] focusState=\(focusStateLog) category=\(category?.rawValue ?? "nil") regionId=\(activeRegionIdForLog ?? "nil")"
         )
 
@@ -371,10 +378,10 @@ final class AudioManager: NSObject, AVAudioPlayerDelegate {
 
         // Primary + secondary stem mapping (secondary used only for debug in this hard-pass).
         let mappedSoloStem = category.flatMap { ColorSoundMapper.soloStem(for: $0, regionId: activeRegionId) }
-        print(
+        audioGateDebugLog(
             "[StemResolve] category=\(category?.rawValue ?? "nil") regionId=\(activeRegionId ?? "nil") resolved=\(mappedSoloStem ?? "NIL")"
         )
-        print(
+        audioGateDebugLog(
             "[Gate2-AudioMix] focusState=\(stateName) category=\(category?.rawValue ?? "nil") resolvedStem=\(mappedSoloStem ?? "nil")"
         )
         let mappedSecondaryStems: [String] = category.map { ColorSoundMapper.secondaryMappings(for: $0) } ?? []
@@ -418,7 +425,7 @@ final class AudioManager: NSObject, AVAudioPlayerDelegate {
         let nonTargetSoloStemsCount = soloPlayersByStem.keys.filter { $0 != mappedSoloStem }.count
 
         let willPromoteStemIdentity = mappedSoloStem != nil && isPreFocusOrFocused(focusState)
-        print(
+        audioGateDebugLog(
             "[StemPromotion] focusState=\(stateName) resolved=\(mappedSoloStem ?? "nil") " +
             "playerLoaded=\(mappedSoloStem.map { soloPlayersByStem[$0] != nil } ?? false) " +
             "willPromote=\(willPromoteStemIdentity)"
@@ -546,13 +553,13 @@ final class AudioManager: NSObject, AVAudioPlayerDelegate {
 
         // Set intent immediately so `debugActiveSoloStem` / mix state cannot stay stale when a prior
         // `Task` was cancelled before its completion handler assigned `activeSoloStem`.
-        print(
+        audioGateDebugLog(
             "[Gate2-StemAssign] willAssign=\(soloStem ?? "nil") currentActive=\(activeSoloStem ?? "nil") focusState=\(gate2FocusStateLabel)"
         )
         activeSoloStem = soloStem
         activeSecondaryStems = secondaryStems
         activeSoloTargetVolume = soloTargetVolume
-        print(
+        audioGateDebugLog(
             "[StemAssigned] activeSoloStem=\(activeSoloStem ?? "NIL") focusState=\(gate2FocusStateLabel)"
         )
 
@@ -634,7 +641,7 @@ final class AudioManager: NSObject, AVAudioPlayerDelegate {
            abs(p.volume - soloTargetVolume) < 0.03 {
             return
         }
-        print(
+        audioGateDebugLog(
             "[Gate2-StemAssign] willAssign=\(soloStem ?? "nil") currentActive=\(activeSoloStem ?? "nil") focusState=focused"
         )
         mixFadeTask?.cancel()
@@ -653,11 +660,11 @@ final class AudioManager: NSObject, AVAudioPlayerDelegate {
         activeSoloStem = soloStem
         activeSecondaryStems = []
         activeSoloTargetVolume = soloTargetVolume
-        print(
+        audioGateDebugLog(
             "[StemAssigned] activeSoloStem=\(activeSoloStem ?? "NIL") focusState=focused"
         )
 
-        print(
+        audioGateDebugLog(
             "[StemPromotion] focusState=focused resolved=\(soloStem ?? "nil") " +
             "playerLoaded=\(soloStem.map { soloPlayersByStem[$0] != nil } ?? false) willPromote=true isolation=1"
         )
@@ -690,6 +697,17 @@ final class AudioManager: NSObject, AVAudioPlayerDelegate {
         #if DEBUG
         print(message)
         #endif
+    }
+
+    /// Returns the current playback amplitude (0–1) for the stem
+    /// associated with the given color category.
+    /// Used exclusively by StemAmplitudeAnalyzer for Chapter 1.
+    func currentStemAmplitude(for category: KandinskyColorCategory) -> Float {
+        guard let stemName = ColorSoundMapper.soloStem(for: category),
+              let player = soloPlayersByStem[stemName] else {
+            return 0.0
+        }
+        return player.isPlaying ? Float(player.volume) : 0.0
     }
 
     // TODO: Spatial audio placement of stems around the painting (RealityKit spatial audio).

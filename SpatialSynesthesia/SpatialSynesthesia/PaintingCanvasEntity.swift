@@ -102,23 +102,6 @@ enum PaintingCanvasEntity {
                 model.materials = [debugPlaneMaterial]
                 plane.components.set(model)
             }
-
-            // Add explicit front/back markers on the interactive plane root.
-            let frontMarker = ModelEntity(
-                mesh: .generateSphere(radius: 0.015),
-                materials: [SimpleMaterial(color: UIColor.systemGreen, isMetallic: false)]
-            )
-            frontMarker.name = "AlignedPlaneFrontMarker"
-            frontMarker.position = SIMD3<Float>(0, 0.03, 0)
-            root.addChild(frontMarker)
-
-            let backMarker = ModelEntity(
-                mesh: .generateSphere(radius: 0.015),
-                materials: [SimpleMaterial(color: UIColor.systemRed, isMetallic: false)]
-            )
-            backMarker.name = "AlignedPlaneBackMarker"
-            backMarker.position = SIMD3<Float>(0, -0.03, 0)
-            root.addChild(backMarker)
         }
 
         // 2. Full-canvas overlay (color updated by GazeInteractionManager)

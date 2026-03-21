@@ -349,6 +349,7 @@ extension ColorSoundMapper {
 
     /// Logs whether each category’s primary solo stem exists in the app bundle (`.m4a`, `.mp3`, `.wav`, `.caf`).
     static func verifyStemFiles() {
+        #if DEBUG
         for cat in KandinskyColorCategory.allCases {
             let stem = soloStem(for: cat)
             let exists = stem.map { s in
@@ -359,6 +360,7 @@ extension ColorSoundMapper {
             } ?? false
             print("[StemVerify] \(cat) → '\(stem ?? "NIL")' fileExists=\(exists)")
         }
+        #endif
     }
 
     static func verifyStemFilesOnceAtLaunch() {

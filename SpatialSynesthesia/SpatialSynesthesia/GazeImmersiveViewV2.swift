@@ -99,13 +99,6 @@ final class PaintingSceneStateV2 {
 
     // MARK: - Scene-level passthrough/world tint (broad wash)
     var worldTintWashEntity: ModelEntity?
-    var worldTintOpacity: Float = 0
-    var worldTintTargetOpacity: Float = 0
-    var worldTintLastTickTime: CFTimeInterval?
-    var lastAppliedTintFocusKey: String?
-    var lastAppliedWorldTintIntensityForEffect: Float = -1
-    /// Dedupes `[Gate3-Tint]` (update loop runs every frame).
-    var gate3LastPrintedSignature: String = ""
 
     // MARK: - Region trust diagnostics
     /// `PaintingCanvas` root from `PaintingCanvasEntity.build` (plane, regions, overlay).
@@ -128,6 +121,9 @@ final class PaintingSceneStateV2 {
     /// Gates initial ensemble + mix until intro veil has fully faded (exactly once).
     var hasStartedExperienceAudio: Bool = false
 
+    /// Throttles `[ColorGrade]` logging (update loop runs every frame).
+    var lastColorGradePrintTime: CFTimeInterval = 0
+
     #if DEBUG
     /// Dedupe gaze `[EyeTrack]` / `[Sound]` / `[Perception]` logs (one set per applied `audioMixVersion`).
     var lastGazeDebugLoggedMixVersion: UInt64?
@@ -146,9 +142,6 @@ final class PaintingSceneStateV2 {
     var debugLastHeartbeatTime: CFTimeInterval?
     /// Dedupe `[LookTarget]` when region id under pointer changes.
     var debugLastLookTargetLogId: String?
-    /// World-space status indicator (no collision/input); mirrors gaze/focus for on-device troubleshooting.
-    var debugSphereEntity: ModelEntity?
-
     /// One-shot `[PaintingPlaneReady]` after intro.
     var debugLoggedPaintingPlaneReadiness: Bool = false
     #endif
@@ -159,20 +152,21 @@ struct GazeImmersiveViewV2: View {
 
     @State private var gazeManager = GazeInteractionManager()
     @State private var sceneState = PaintingSceneStateV2()
-
-    @State private var lastTapMarker: ModelEntity?
+    @StateObject private var chapterController = ChapterController()
+    @State private var orchestrator: SynesthesiaOrchestrator?
 
     // Primary, supported passthrough tint via SurroundingsEffect.
     @State private var preferredSurroundingsEffectValue: SurroundingsEffect? = nil
-
-    // Debug fallback: inverted-sphere wash proxy (kept for development / if SurroundingsEffect
-    // can't be honored by the system for some reason).
-    private let useInvertedSphereWashFallback: Bool = false
 
     var body: some View {
         RealityView { content in
             await setupScene(content: content)
         }
+        .overlay(
+            Color.black.opacity(chapterController.fadeOpacity)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+        )
         .gesture(
             SpatialTapGesture()
                 .targetedToAnyEntity()
@@ -181,6 +175,17 @@ struct GazeImmersiveViewV2: View {
                 }
         )
         .preferredSurroundingsEffect(preferredSurroundingsEffectValue)
+        .onAppear {
+            orchestrator = SynesthesiaOrchestrator(audioManager: AudioManager.shared)
+            orchestrator?.isActive = true
+            chapterController.begin()
+            #if DEBUG
+            Task {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                await MainActor.run { diagnoseColorGrade() }
+            }
+            #endif
+        }
     }
 
     private func setupScene(content: RealityViewContent) async {
@@ -341,12 +346,6 @@ struct GazeImmersiveViewV2: View {
         }
         #endif
 
-        #if DEBUG
-        let debugSphere = makeDebugInteractionSphereEntity()
-        result.root.addChild(debugSphere)
-        sceneState.debugSphereEntity = debugSphere
-        #endif
-
         // Hide interactive canvas until intro shell completes (no change to immersion style / startup order).
         result.root.isEnabled = false
 
@@ -359,12 +358,48 @@ struct GazeImmersiveViewV2: View {
             Task { @MainActor in
                 sceneState.sceneFromUpdateLoop = event.scene
 
+                let deltaTime = Float(event.deltaTime)
+                chapterController.tick()
+                if chapterController.currentChapter == .transitioning {
+                    chapterController.updateTransitionBlend(deltaTime: deltaTime)
+                }
+
+                if chapterController.isChapterOneActive {
+                    if let plane = sceneState.paintingPlaneEntity {
+                        orchestrator?.setupHighlightEntities(
+                            regions: AuthoredPaintingRegion.kandinskyComposition,
+                            paintingEntity: plane
+                        )
+                    }
+                    orchestrator?.chapterBlend = chapterController.chapterOneBlend
+                    orchestrator?.update(
+                        elapsed: chapterController.chapterOneElapsed,
+                        deltaTime: deltaTime,
+                        paintingRegions: AuthoredPaintingRegion.kandinskyComposition,
+                        applyColorGrade: { cat, intensity in
+                            self.applyPassthroughColorGrade(category: cat, intensity: intensity)
+                        }
+                    )
+                }
+
                 // 0) Fade the intro veil independently from gaze/audio/region logic.
                 let introJustCompleted = tickIntroVeil()
 
                 #if DEBUG
                 logPaintingPlaneReadinessOnce()
                 #endif
+
+                if introJustCompleted {
+                    AudioManager.shared.isIntroAudioGated = false
+                    sceneState.hasStartedExperienceAudio = true
+                    AudioManager.shared.setAudioMix(
+                        focusState: gazeManager.focusState,
+                        category: gazeManager.responseCategory
+                    )
+                    sceneState.lastAppliedAudioMixVersion = gazeManager.audioMixVersion
+                }
+
+                guard chapterController.currentChapter == .chapterTwo else { return }
 
                 // 1) Update focus state: spatial pointer on `PaintingPlane` or head-ray fallback → authored zones.
                 let gazeCandidate = currentGazeCandidateRegion()
@@ -401,10 +436,6 @@ struct GazeImmersiveViewV2: View {
                 // 2) Smooth overlay fade (overlay application is gated separately).
                 gazeManager.tickOverlayFade()
                 applyOverlayNow()
-
-                #if DEBUG
-                updateDebugInteractionSphereVisual()
-                #endif
 
                 // 2b) Broad world tint wash driven by the same focus state machine.
                 updateWorldTintFromFocusState()
@@ -518,9 +549,13 @@ struct GazeImmersiveViewV2: View {
             sceneState.worldTracking = provider
             do {
                 try await session.run([provider])
+                #if DEBUG
                 print("[GazeImmersiveViewV2] WorldTrackingProvider started for device-anchor gaze")
+                #endif
             } catch {
+                #if DEBUG
                 print("[GazeDiag-1] WorldTrackingProvider run failed: \(error)")
+                #endif
             }
         }
 
@@ -714,76 +749,6 @@ struct GazeImmersiveViewV2: View {
         )
     }
 
-    private func uiColorFromAuthoredHex(_ hex: String) -> UIColor? {
-        UIColor(hex: hex)
-    }
-
-    private func sphereTintForAuthoredRegion(id: String, fallback: KandinskyColorCategory) -> UIColor {
-        if let authored = AuthoredPaintingRegion.kandinskyComposition.first(where: { $0.id == id }) {
-            return authored.category.vividTintColor
-        }
-        return fallback.vividTintColor
-    }
-
-    /// DEBUG-only world-space indicator beside the painting: mirrors gaze hit + `GazeInteractionManager` focus (does not drive behavior).
-    /// No `CollisionComponent` / `InputTargetComponent` / `HoverEffectComponent` — does not participate in raycasts.
-    private func makeDebugInteractionSphereEntity() -> ModelEntity {
-        let mesh = MeshResource.generateSphere(radius: 1.0)
-        let material = UnlitMaterial(color: UIColor.white.withAlphaComponent(0))
-        let sphere = ModelEntity(mesh: mesh, materials: [material])
-        sphere.name = "DebugInteractionSphere"
-        // Local space of `PaintingCanvas` root: right of artwork, slightly above mid, slightly forward.
-        sphere.position = SIMD3<Float>(0.45, 0.15, 0.02)
-        sphere.scale = SIMD3<Float>(repeating: 0.028)
-        sphere.components.set(OpacityComponent(opacity: 0))
-        return sphere
-    }
-
-    /// Updates debug sphere from existing state only (after `submitGazeCandidate` + `tickOverlayFade`).
-    private func updateDebugInteractionSphereVisual() {
-        guard let sphere = sceneState.debugSphereEntity else { return }
-        guard let canvasRoot = sceneState.paintingCanvasRoot,
-              canvasRoot.isEnabled,
-              !sceneState.introIsActive else {
-            sphere.components.set(OpacityComponent(opacity: 0))
-            return
-        }
-
-        let baseRadius: Float = 0.028
-        let focus = gazeManager.focusState
-
-        func apply(color: UIColor, opacity: Float, uniformScale: Float) {
-            guard var model = sphere.components[ModelComponent.self] else { return }
-            model.materials = [UnlitMaterial(color: color)]
-            sphere.components.set(model)
-            sphere.components.set(OpacityComponent(opacity: opacity))
-            sphere.scale = SIMD3<Float>(repeating: uniformScale)
-        }
-
-        switch focus {
-        case .released:
-            apply(color: .white, opacity: 0, uniformScale: baseRadius)
-
-        case .noFocus:
-            if let id = sceneState.currentLookTargetRegionId {
-                let cat = sceneState.regionByEntityName[id]?.colorCategory ?? .gray
-                let c = sphereTintForAuthoredRegion(id: id, fallback: cat)
-                apply(color: c, opacity: 0.72, uniformScale: baseRadius * 0.88)
-            } else {
-                apply(color: .white, opacity: 0, uniformScale: baseRadius)
-            }
-
-        case .preFocus(let region):
-            let cat = gazeManager.responseCategory ?? region.colorCategory
-            let c = sphereTintForAuthoredRegion(id: region.id, fallback: cat)
-            apply(color: c, opacity: 0.92, uniformScale: baseRadius * 1.0)
-
-        case .focused(let region):
-            let cat = gazeManager.responseCategory ?? region.colorCategory
-            let c = sphereTintForAuthoredRegion(id: region.id, fallback: cat)
-            apply(color: c, opacity: 1.0, uniformScale: baseRadius * 1.22)
-        }
-    }
     #endif
 
     /// Applies the overlay tint immediately based on the current fade state.
@@ -907,19 +872,7 @@ struct GazeImmersiveViewV2: View {
         return false
     }
 
-    // MARK: - World tint wash (broad immersive visual cue)
-
-    /// Passthrough tint fade timing (world multiply envelope — not `AudioManager` crossfades).
-    private let tintFadeInDuration: TimeInterval = 0.20
-    private let tintFadeOutDuration: TimeInterval = 0.70
-    /// First-order step toward target each frame: tuned from `tintFadeInDuration` / `tintFadeOutDuration`.
-    private let worldTintAttackBlendSpeed: Float = Float(4.0 / 0.20)
-    private let worldTintReleaseBlendSpeed: Float = Float(4.0 / 0.70)
-    private let worldTintPreFocusIntensity: Float = 0.45
-    private let worldTintFocusedIntensity: Float = 0.90
-
-    private let surroundingsTintPreFocusIntensity: Float = 0.45
-    private let surroundingsTintFocusedIntensity: Float = 0.90
+    // MARK: - Passthrough color grade (SurroundingsEffect — single entry point)
 
     private func makeWorldTintWashEntity() -> ModelEntity {
         // Large sphere around the camera so the whole immersive view appears tinted.
@@ -935,228 +888,80 @@ struct GazeImmersiveViewV2: View {
         return entity
     }
 
-    private func neutralTintMultiplier(for category: KandinskyColorCategory) -> Float {
-        // Keep neutrals perceptible but controlled.
-        switch category {
-        case .black: return 0.55
-        case .gray: return 0.50
-        case .white: return 0.35
-        case .brown: return 0.65
-        default: return 1.0
+    #if DEBUG
+    private func diagnoseColorGrade() {
+        let additiveBoostFactor: CGFloat = 0.35
+        for cat in KandinskyColorCategory.allCases {
+            let color = cat.vividTintColor
+            var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            color.getRed(&r, green: &g, blue: &b, alpha: &a)
+            let intensity = cat.tintIntensity
+            let boost: CGFloat = 1.0 + CGFloat(intensity) * additiveBoostFactor
+            let fR = min(1.0, (1.0 - (1.0 - r) * CGFloat(intensity)) * (r > 0.5 ? boost : 1.0))
+            let fG = min(1.0, (1.0 - (1.0 - g) * CGFloat(intensity)) * (g > 0.5 ? boost : 1.0))
+            let fB = min(1.0, (1.0 - (1.0 - b) * CGFloat(intensity)) * (b > 0.5 ? boost : 1.0))
+            print("[GradeDiag] \(cat) intensity=\(intensity) finalRGB=(\(String(format: "%.2f", fR)),\(String(format: "%.2f", fG)),\(String(format: "%.2f", fB)))")
         }
     }
+    #endif
 
-    /// Builds a multiply color whose "distance from white" controls tint intensity.
-    /// - Note: this is an approximation for intensity because SurroundingsEffect
-    ///   `colorMultiply` does not expose a separate intensity parameter.
-    private func surroundingsMultiplyColor(category: KandinskyColorCategory?, intensity: Float) -> Color {
-        guard let cat = category else { return .white }
-        let tintIntensityMultiplier: Float = 1.8
-        let finalIntensity = min(1.0, cat.tintIntensity * tintIntensityMultiplier)
-        let isChromatic: Bool = {
-            switch cat {
-            case .red, .yellow, .blue, .green, .violet, .orange, .brown:
-                return true
-            case .gray, .white, .black:
-                return false
-            }
-        }()
-        let chromaticMultiplyBoost: CGFloat = isChromatic ? 1.22 : 1.0
+    /// Sole mutator for `preferredSurroundingsEffectValue` (Chapter 1 score + Chapter 2 gaze).
+    private func applyPassthroughColorGrade(category: KandinskyColorCategory, intensity: Float) {
+        let additiveBoostFactor: CGFloat = 0.35
+        guard intensity > 0.02 else {
+            preferredSurroundingsEffectValue = nil
+            return
+        }
 
-        let rawColor = cat.vividTintColor
-        let boosted = rawColor.withMinSaturation(0.80)
+        let color = category.vividTintColor
+        let strength = CGFloat(category.tintIntensity) * CGFloat(intensity)
 
-        let env = max(0, min(1, CGFloat(intensity)))
-        let t = min(1, env * CGFloat(finalIntensity) * chromaticMultiplyBoost)
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        color.getRed(&r, green: &g, blue: &b, alpha: &a)
 
-        var r: CGFloat = 1
-        var g: CGFloat = 1
-        var b: CGFloat = 1
-        var a: CGFloat = 1
-        _ = boosted.getRed(&r, green: &g, blue: &b, alpha: &a)
+        let boost: CGFloat = 1.0 + strength * additiveBoostFactor
 
-        let rr = 1 * (1 - t) + r * t
-        let gg = 1 * (1 - t) + g * t
-        let bb = 1 * (1 - t) + b * t
+        let finalR = min(1.0, (1.0 - (1.0 - r) * strength) * (r > 0.5 ? boost : 1.0))
+        let finalG = min(1.0, (1.0 - (1.0 - g) * strength) * (g > 0.5 ? boost : 1.0))
+        let finalB = min(1.0, (1.0 - (1.0 - b) * strength) * (b > 0.5 ? boost : 1.0))
 
-        return Color(red: rr, green: gg, blue: bb)
+        let gradeColor = Color(
+            red: Double(finalR),
+            green: Double(finalG),
+            blue: Double(finalB)
+        )
+
+        preferredSurroundingsEffectValue = .colorMultiply(gradeColor)
+
+        let now = Date.timeIntervalSinceReferenceDate
+        if now - sceneState.lastColorGradePrintTime > 1.0 {
+            sceneState.lastColorGradePrintTime = now
+            print("[ColorGrade] cat=\(category) strength=\(String(format: "%.2f", intensity))")
+            #if DEBUG
+            print(
+                "[ColorGrade] dbg rgb=(\(String(format: "%.2f", finalR)),\(String(format: "%.2f", finalG)),\(String(format: "%.2f", finalB))) " +
+                "materialStrength=\(String(format: "%.2f", strength))"
+            )
+            #endif
+        }
     }
 
     private func updateWorldTintFromFocusState() {
         guard let wash = sceneState.worldTintWashEntity else { return }
 
-        let (focusKey, focusStateName, targetTintIntensity, targetCategory, targetRegionName, targetPaintingRegion): (String, String, Float, KandinskyColorCategory?, String, PaintingRegion?) = {
-            switch gazeManager.focusState {
-            case .noFocus:
-                return ("noFocus", "noFocus", 0, nil, "nil", nil)
-            case .released:
-                return ("released", "released", 0, nil, "nil", nil)
-            case .preFocus(let region):
-                let cat = gazeManager.responseCategory ?? region.colorCategory
-                let mult = neutralTintMultiplier(for: cat)
-                return (
-                    "preFocus:\(region.id)",
-                    "preFocus",
-                    surroundingsTintPreFocusIntensity * mult,
-                    cat,
-                    region.name,
-                    region
-                )
-            case .focused(let region):
-                let cat = gazeManager.responseCategory ?? region.colorCategory
-                let mult = neutralTintMultiplier(for: cat)
-                return (
-                    "focused:\(region.id)",
-                    "focused",
-                    surroundingsTintFocusedIntensity * mult,
-                    cat,
-                    region.name,
-                    region
-                )
-            }
-        }()
+        ColorFilterOverlay.updateOverlay(wash, color: .clear)
 
-        let hexLog: String = {
-            if let c = targetCategory { return "vividTint:\(c.rawValue)" }
-            return "none"
-        }()
-        let catLog = targetCategory?.rawValue ?? "nil"
-        let gate3Sig = "\(focusStateName)|\(targetPaintingRegion?.id ?? "nil")|\(catLog)|\(hexLog)"
-        if gate3Sig != sceneState.gate3LastPrintedSignature {
-            sceneState.gate3LastPrintedSignature = gate3Sig
-            print(
-                "[Gate3-Tint] focusState=\(focusStateName) region=\(targetPaintingRegion?.name ?? "nil") category=\(catLog) hex=\(hexLog)"
-            )
-            print(
-                "[TintEntry] focusState=\(focusStateName) category=\(catLog) region=\(targetPaintingRegion?.entityName ?? "nil")"
-            )
-        }
-
-        // Smooth intensity continuously (attack/release) so audio + overlay + world tint stay coherent.
-        let now = CACurrentMediaTime()
-        let dt: Float = {
-            guard let last = sceneState.worldTintLastTickTime else { return 1.0 / 60.0 }
-            return Float(max(0, now - last))
-        }()
-        sceneState.worldTintLastTickTime = now
-
-        sceneState.worldTintTargetOpacity = targetTintIntensity
-        let speed = sceneState.worldTintTargetOpacity > sceneState.worldTintOpacity ? worldTintAttackBlendSpeed : worldTintReleaseBlendSpeed
-        let blendFactor = min(1, speed * dt)
-        sceneState.worldTintOpacity = sceneState.worldTintOpacity
-            + (sceneState.worldTintTargetOpacity - sceneState.worldTintOpacity) * blendFactor
-
-        // Fallback proxy wash (inverted sphere) - ONLY for debug/development.
-        if useInvertedSphereWashFallback {
-            if let cat = targetCategory, sceneState.worldTintOpacity > 0.001 {
-                let tintUIColor = cat.overlayTint.withAlphaComponent(CGFloat(sceneState.worldTintOpacity))
-                ColorFilterOverlay.updateOverlay(wash, color: tintUIColor)
-            } else {
-                ColorFilterOverlay.updateOverlay(wash, color: .clear)
-            }
-        } else {
-            ColorFilterOverlay.updateOverlay(wash, color: .clear)
-        }
-
-        // Primary world tint: real SurroundingsEffect tint (colorMultiply).
-        if !useInvertedSphereWashFallback {
-            let effectIntensity = sceneState.worldTintOpacity
-            let effectActive = targetCategory != nil && effectIntensity > 0.001
-
-            if effectActive {
-                // Avoid spamming the preferredSurroundingsEffect when intensity changes minimally.
-                let shouldUpdateEffect =
-                    abs(effectIntensity - sceneState.lastAppliedWorldTintIntensityForEffect) > 0.01 ||
-                    sceneState.lastAppliedTintFocusKey != focusKey
-
-                if shouldUpdateEffect, let cat = targetCategory {
-                    let vivid = cat.vividTintColor
-                    print(
-                        "[TintColorResolve] willUseVivid=true color=\(vivid)"
-                    )
-                    let multiplyColor = surroundingsMultiplyColor(
-                        category: cat,
-                        intensity: effectIntensity
-                    )
-                    print(
-                        "[Gate3-TintAssign] color=\(multiplyColor) intensity=\(effectIntensity)"
-                    )
-                    preferredSurroundingsEffectValue = .colorMultiply(multiplyColor)
-                    sceneState.lastAppliedWorldTintIntensityForEffect = effectIntensity
-                    let uiTint = UIColor(multiplyColor)
-                    var tr: CGFloat = 0
-                    var tg: CGFloat = 0
-                    var tb: CGFloat = 0
-                    var ta: CGFloat = 0
-                    _ = uiTint.getRed(&tr, green: &tg, blue: &tb, alpha: &ta)
-                    print(
-                        "[TintApplied] intensity=\(effectIntensity) rgb=\(tr),\(tg),\(tb)"
-                    )
-                }
-            } else {
-                preferredSurroundingsEffectValue = nil
-                sceneState.lastAppliedWorldTintIntensityForEffect = 0
-            }
-        } else {
-            preferredSurroundingsEffectValue = nil
-            sceneState.lastAppliedWorldTintIntensityForEffect = 0
-        }
-
-        // Trust-check logging: only when focus identity changes.
-        if sceneState.lastAppliedTintFocusKey != focusKey {
-            sceneState.lastAppliedTintFocusKey = focusKey
-
-            let overlayIntensity = gazeManager.overlayOpacityForMaterial
-
-            let activeColor = targetCategory?.rawValue ?? "nil"
-            let activeSoloStem = gazeManager.responseCategory.flatMap {
-                ColorSoundMapper.soloStem(for: $0, regionId: gazeManager.activeRegion?.id)
-            }
-            let activeSoloFile = activeSoloStem.map { "\($0).m4a" } ?? "nil"
-
-            let ensembleNearSilenceFactorForBlack: Float = 0.05
-            let ensembleWhiteGrayFactor: Float = 0.85
-            let categoryFactor: Float = {
-                guard let c = targetCategory else { return 1.0 }
-                switch c {
-                case .black: return ensembleNearSilenceFactorForBlack
-                case .white, .gray: return ensembleWhiteGrayFactor
-                default: return 1.0
-                }
-            }()
-
-            let ensembleTargetVolume: Float = {
-                switch gazeManager.focusState {
-                case .noFocus, .released:
-                    return AudioManager.ensembleBaseVolume
-                case .preFocus:
-                    return AudioManager.ensemblePrefocusVolume * categoryFactor
-                case .focused:
-                    return AudioManager.ensembleFocusedVolume * categoryFactor
-                }
-            }()
-
-            let effectIntensity = sceneState.worldTintOpacity
-            let effectActive = (!useInvertedSphereWashFallback) && targetCategory != nil && effectIntensity > 0.001
-            var multR: CGFloat = 1
-            var multG: CGFloat = 1
-            var multB: CGFloat = 1
-            var multA: CGFloat = 1
-            if effectActive, let c = targetCategory {
-                let ui = UIColor(surroundingsMultiplyColor(
-                    category: c,
-                    intensity: effectIntensity
-                ))
-                _ = ui.getRed(&multR, green: &multG, blue: &multB, alpha: &multA)
-            }
-
-            print(
-                "[TrustSyncTint] focusState=\(focusStateName) region=\(targetRegionName) responseCategory=\(activeColor) " +
-                "tintIntensity(target)=\(String(format: "%.2f", targetTintIntensity)) tintIntensity(current)=\(String(format: "%.2f", sceneState.worldTintOpacity)) " +
-                "surroundingsEffect=\(effectActive ? "ACTIVE" : "neutral") multiplyRGB=\(String(format: "%.2f", multR)),\(String(format: "%.2f", multG)),\(String(format: "%.2f", multB)) " +
-                "overlayOpacity=\(String(format: "%.2f", gazeManager.overlayOpacity)) overlayIntensity=\(String(format: "%.2f", overlayIntensity)) " +
-                "activeSoloStem=\(activeSoloFile) ensembleTargetVol=\(String(format: "%.2f", ensembleTargetVolume))"
-            )
+        switch gazeManager.focusState {
+        case .noFocus, .released:
+            // Neutral clear — not `.white` (avoids implying a white tint at rest).
+            applyPassthroughColorGrade(category: .gray, intensity: 0)
+        case .preFocus(let region):
+            let cat = gazeManager.responseCategory ?? region.colorCategory
+            applyPassthroughColorGrade(category: cat, intensity: 0.40)
+        case .focused(let region):
+            // Snap to full grade on the exact frame dwell completes (no animation / lerp).
+            let cat = gazeManager.responseCategory ?? region.colorCategory
+            applyPassthroughColorGrade(category: cat, intensity: 1.0)
         }
     }
 
@@ -1173,11 +978,6 @@ struct GazeImmersiveViewV2: View {
             #endif
             let localPoint = value.convert(value.location3D, from: .local, to: tappedEntity)
             let localPosition = (Float(localPoint.x), Float(localPoint.y), Float(localPoint.z))
-
-            // Visual tap marker for debug readability (same style as region taps).
-            if appModel.isDebugMode {
-                updateTapMarker(on: tappedEntity, localPosition: localPosition)
-            }
 
             if let mappedRegion = regionForLocalPoint(localPoint) {
                 if gazeManager.activeRegion?.id == mappedRegion.id {
@@ -1235,7 +1035,7 @@ struct GazeImmersiveViewV2: View {
     /// Gaze hit on `PaintingPlane` via ARKit device anchor + analytic ray–plane intersection (`MeshResource.generatePlane` → local +Y face normal).
     private func localPointOnPaintingPlaneForGaze() -> SIMD3<Float>? {
         guard let worldTrackingProvider = sceneState.worldTracking else {
-            print("[GazeDiag-1] DeviceAnchor unavailable")
+            gazeRayDebugLog("[GazeDiag-1] DeviceAnchor unavailable")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1243,7 +1043,7 @@ struct GazeImmersiveViewV2: View {
         }
 
         guard worldTrackingProvider.state == .running else {
-            print("[GazeDiag-1] WorldTrackingProvider not running: \(worldTrackingProvider.state)")
+            gazeRayDebugLog("[GazeDiag-1] WorldTrackingProvider not running: \(worldTrackingProvider.state)")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1252,7 +1052,7 @@ struct GazeImmersiveViewV2: View {
 
         let time = CACurrentMediaTime()
         guard let deviceAnchor = worldTrackingProvider.queryDeviceAnchor(atTimestamp: time) else {
-            print("[GazeDiag-2] HeadAnchor unavailable")
+            gazeRayDebugLog("[GazeDiag-2] HeadAnchor unavailable")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1260,7 +1060,7 @@ struct GazeImmersiveViewV2: View {
         }
 
         guard let painting = sceneState.paintingPlaneEntity else {
-            print("[GazeDiag-3] paintingEntity is nil")
+            gazeRayDebugLog("[GazeDiag-3] paintingEntity is nil")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1269,7 +1069,7 @@ struct GazeImmersiveViewV2: View {
 
         let worldTransform = painting.transformMatrix(relativeTo: nil)
         guard worldTransform != matrix_identity_float4x4 else {
-            print("[GazeDiag-4] painting world transform is identity or invalid")
+            gazeRayDebugLog("[GazeDiag-4] painting world transform is identity or invalid")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1289,13 +1089,13 @@ struct GazeImmersiveViewV2: View {
                 -deviceTransform.columns.2.z
             )
         )
-        print("[GazeDiag-5] ray origin built: \(rayOrigin), dir: \(rayDir)")
+        gazeRayDebugLog("[GazeDiag-5] ray origin built: \(rayOrigin), dir: \(rayDir)")
 
         // `generatePlane(width:depth:)` lies in XZ; face normal is local +Y → world column 1.
         let col1 = worldTransform.columns.1
         var planeNormal = normalize(SIMD3<Float>(col1.x, col1.y, col1.z))
         guard simd_length(planeNormal) > 1e-6 else {
-            print("[GazeDiag-4] painting world transform is identity or invalid")
+            gazeRayDebugLog("[GazeDiag-4] painting world transform is identity or invalid")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1308,11 +1108,11 @@ struct GazeImmersiveViewV2: View {
             worldTransform.columns.3.z
         )
         if dot(planeNormal, rayDir) > 0 { planeNormal = -planeNormal }
-        print("[GazeDiag-6] plane normal: \(planeNormal), planePoint: \(planePoint)")
+        gazeRayDebugLog("[GazeDiag-6] plane normal: \(planeNormal), planePoint: \(planePoint)")
 
         let denom = dot(planeNormal, rayDir)
         guard abs(denom) > 1e-6 else {
-            print("[GazeDiag-7] denom near zero = \(denom), ray parallel to plane")
+            gazeRayDebugLog("[GazeDiag-7] denom near zero = \(denom), ray parallel to plane")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1321,7 +1121,7 @@ struct GazeImmersiveViewV2: View {
 
         let t = dot(planeNormal, planePoint - rayOrigin) / denom
         guard t > 0 else {
-            print("[GazeDiag-8] t value negative = \(t), intersection behind origin")
+            gazeRayDebugLog("[GazeDiag-8] t value negative = \(t), intersection behind origin")
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             #endif
@@ -1329,33 +1129,25 @@ struct GazeImmersiveViewV2: View {
         }
 
         let worldHit = rayOrigin + rayDir * t
-        print("[GazeDiag-9] worldHit computed: \(worldHit)")
+        gazeRayDebugLog("[GazeDiag-9] worldHit computed: \(worldHit)")
 
         let worldHit4 = SIMD4<Float>(worldHit.x, worldHit.y, worldHit.z, 1.0)
         let localHit4 = simd_mul(simd_inverse(worldTransform), worldHit4)
 
-        // Empirically calibrated from device boundary samples (two separate runs).
-        // Mesh local x half-extent (~2.015) maps to region x half-extent (0.37).
-        // Mesh local z half-extent (~4.162) maps to region z half-extent (0.47).
-        // These are fixed geometric constants of PaintingCanvasEntity's mesh.
-        let kScaleX: Float = 5.446
-        let kScaleZ: Float = 8.855
-
-        let remappedLocal = SIMD3<Float>(
-            localHit4.x / kScaleX,
-            localHit4.y,
-            localHit4.z / kScaleZ
+        // Mesh local ↔ authored logical space (see `PaintingPlaneCoordinateSpace`).
+        let remappedLocal = PaintingPlaneCoordinateSpace.meshLocalPointToAuthored(
+            SIMD3<Float>(localHit4.x, localHit4.y, localHit4.z)
         )
 
-        print("[LocalSpaceCheck] paintingScale=\(painting.scale(relativeTo: nil)) localRaw=(\(localHit4.x), \(localHit4.y), \(localHit4.z))")
-        print("[GazeDiag-10] localHit computed: \(remappedLocal)")
+        gazeRayDebugLog("[LocalSpaceCheck] paintingScale=\(painting.scale(relativeTo: nil)) localRaw=(\(localHit4.x), \(localHit4.y), \(localHit4.z))")
+        gazeRayDebugLog("[GazeDiag-10] localHit computed: \(remappedLocal)")
 
         if let firstRegion = AuthoredPaintingRegion.kandinskyComposition.first {
-            print("[RegionBoundsCheck] firstRegion center=\(firstRegion.localCenter) size=\(firstRegion.localSize)")
+            gazeRayDebugLog("[RegionBoundsCheck] firstRegion center=\(firstRegion.localCenter) size=\(firstRegion.localSize)")
         }
         if AuthoredPaintingRegion.resolveAuthoredRegion(localPoint: remappedLocal) == nil {
             AuthoredPaintingRegion.kandinskyComposition.forEach {
-                print("[RegionDump] \($0.category) center=\($0.localCenter) size=\($0.localSize)")
+                gazeRayDebugLog("[RegionDump] \($0.category) center=\($0.localCenter) size=\($0.localSize)")
             }
         }
 
@@ -1369,7 +1161,7 @@ struct GazeImmersiveViewV2: View {
         )
         #endif
 
-        print("[LocalPointSuccess] source=ray local=\(remappedLocal)")
+        gazeRayDebugLog("[LocalPointSuccess] source=ray local=\(remappedLocal)")
         return remappedLocal
     }
 
@@ -1410,7 +1202,7 @@ struct GazeImmersiveViewV2: View {
 
         let resolvedAuthored = AuthoredPaintingRegion.resolveAuthoredRegion(localPoint: localOnPlane)
         if resolvedAuthored == nil {
-            print(
+            gazeRayDebugLog(
                 "[RegionFallback] no authored region matched localPt=\(localOnPlane) using background fallback"
             )
         }
@@ -1429,7 +1221,7 @@ struct GazeImmersiveViewV2: View {
     private func regionForLocalPoint(_ localPoint: SIMD3<Float>) -> PaintingRegion? {
         let resolvedAuthored = AuthoredPaintingRegion.resolveAuthoredRegion(localPoint: localPoint)
         if resolvedAuthored == nil {
-            print(
+            gazeRayDebugLog(
                 "[RegionFallback] no authored region matched localPt=\(localPoint) using background fallback"
             )
         }
@@ -1454,19 +1246,6 @@ struct GazeImmersiveViewV2: View {
         return SIMD3<Float>(lp.x, lp.y, lp.z)
     }
 
-    private func updateTapMarker(on entity: Entity, localPosition: (x: Float, y: Float, z: Float)) {
-        lastTapMarker?.removeFromParent()
-
-        let marker = ModelEntity(
-            mesh: .generateSphere(radius: 0.012),
-            materials: [SimpleMaterial(color: UIColor.systemRed, isMetallic: false)]
-        )
-        marker.name = "TapMarker"
-        marker.position = SIMD3<Float>(localPosition.x, localPosition.y, localPosition.z)
-        entity.addChild(marker)
-        lastTapMarker = marker
-    }
-
     private func findEntity(in root: Entity, named name: String) -> Entity? {
         if root.name == name { return root }
         for child in root.children {
@@ -1477,6 +1256,15 @@ struct GazeImmersiveViewV2: View {
         return nil
     }
 }
+
+#if DEBUG
+fileprivate func gazeRayDebugLog(_ message: @autoclosure () -> String) {
+    print(message())
+}
+#else
+@inline(__always)
+fileprivate func gazeRayDebugLog(_ message: @autoclosure () -> String) {}
+#endif
 
 #Preview(immersionStyle: .mixed) {
     GazeImmersiveViewV2()

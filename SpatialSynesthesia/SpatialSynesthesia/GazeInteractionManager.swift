@@ -18,6 +18,16 @@ private func spatialSynesthesiaDebugLog(_ message: String) {
 }
 #endif
 
+/// Gate / dwell trace lines — stripped in release (no console flood).
+#if DEBUG
+private func gazeInteractionTraceLog(_ message: @autoclosure () -> String) {
+    print(message())
+}
+#else
+@inline(__always)
+private func gazeInteractionTraceLog(_ message: @autoclosure () -> String) {}
+#endif
+
 @MainActor
 final class GazeInteractionManager {
     // MARK: - Focus model (VisionOS gaze/dwell MVP)
@@ -333,7 +343,7 @@ final class GazeInteractionManager {
     }
 
     private func printDwellCheck(region: PaintingRegion) {
-        print("[DwellCheck] threshold=\(dwellDuration) region=\(region.id)")
+        gazeInteractionTraceLog("[DwellCheck] threshold=\(dwellDuration) region=\(region.id)")
     }
 
     private func categoryLabelForGate1(from state: FocusState) -> String {
@@ -357,15 +367,15 @@ final class GazeInteractionManager {
         // Ignore gaze updates briefly after a tap override.
         let now = CACurrentMediaTime()
 
-        print(
-            "[Gate1-Candidate] category=\(candidate?.colorCategory ?? .white) region=\(candidate?.name ?? "nil")"
+        gazeInteractionTraceLog(
+            "[Gate1-Candidate] category=\(candidate.map { "\($0.colorCategory)" } ?? "nil") region=\(candidate?.name ?? "nil")"
         )
-        print(
+        gazeInteractionTraceLog(
             "[CandidateIn] region=\(candidate?.id ?? "nil") category=\(candidate.map { $0.colorCategory.rawValue } ?? "none")"
         )
 
         if let until = gazeOverrideUntil, now < until {
-            print("[CandidateIn] skipped gazeOverrideActive=true")
+            gazeInteractionTraceLog("[CandidateIn] skipped gazeOverrideActive=true")
             return
         }
 
@@ -406,8 +416,8 @@ final class GazeInteractionManager {
             #endif
 
             let oldFS = focusState
-            print("[StateTransition] \(focusLabelForDiagnostics(focusState)) → released region=nil")
-            print(
+            gazeInteractionTraceLog("[StateTransition] \(focusLabelForDiagnostics(focusState)) → released region=nil")
+            gazeInteractionTraceLog(
                 "[Gate1-Transition] \(focusLabelForDiagnostics(oldFS)) → released category=\(categoryLabelForGate1(from: oldFS))"
             )
 
@@ -435,23 +445,23 @@ final class GazeInteractionManager {
         }
 
         if gate1PreviousResolvedRegionId != resolved.id {
-            print("[Gate1-DwellReset] new region=\(resolved.entityName)")
+            gazeInteractionTraceLog("[Gate1-DwellReset] new region=\(resolved.entityName)")
             gate1PreviousResolvedRegionId = resolved.id
         }
 
         if case .preFocus(let pr) = focusState, preFocusStartTime == nil {
             preFocusStartTime = now
-            print("[Gate1-DwellRepair] reseeded preFocusStartTime region=\(pr.entityName)")
+            gazeInteractionTraceLog("[Gate1-DwellRepair] reseeded preFocusStartTime region=\(pr.entityName)")
         }
 
         switch focusState {
         case .noFocus:
             dwellSwitchStreakRegionId = nil
             dwellSwitchStreakCount = 0
-            print("[StateTransition] \(focusLabelForDiagnostics(focusState)) → preFocus region=\(resolved.id)")
+            gazeInteractionTraceLog("[StateTransition] \(focusLabelForDiagnostics(focusState)) → preFocus region=\(resolved.id)")
             let oldNF = focusState
             focusState = .preFocus(resolved)
-            print(
+            gazeInteractionTraceLog(
                 "[Gate1-Transition] \(focusLabelForDiagnostics(oldNF)) → \(focusLabelForDiagnostics(focusState)) category=\(resolved.colorCategory.rawValue)"
             )
             preFocusStartTime = now
@@ -494,9 +504,9 @@ final class GazeInteractionManager {
                     let elapsed = now - start
                     if now - start >= dwellDuration {
                         let oldPF = focusState
-                        print("[StateTransition] preFocus(\(region.id)) → focused(\(region.id)) region=\(region.id)")
+                        gazeInteractionTraceLog("[StateTransition] preFocus(\(region.id)) → focused(\(region.id)) region=\(region.id)")
                         focusState = .focused(region)
-                        print(
+                        gazeInteractionTraceLog(
                             "[Gate1-Transition] \(focusLabelForDiagnostics(oldPF)) → \(focusLabelForDiagnostics(focusState)) category=\(region.colorCategory.rawValue)"
                         )
                         preFocusStartTime = nil
@@ -517,7 +527,7 @@ final class GazeInteractionManager {
                         overlayCategoryForFade = responseCategory ?? region.colorCategory
                         overlayTargetOpacity = 1
                     } else {
-                        print(
+                        gazeInteractionTraceLog(
                             "[Gate1-Dwell] elapsed=\(elapsed) threshold=\(dwellDuration) region=\(region.entityName) category=\(region.colorCategory.rawValue)"
                         )
                         #if DEBUG
@@ -535,10 +545,10 @@ final class GazeInteractionManager {
                 let elapsedDrop = preFocusStartTime.map { now - $0 } ?? 0
                 logFocusLoseCandidateDropped(regionId: region.id, elapsed: elapsedDrop)
                 #endif
-                print("[StateTransition] preFocus(\(region.id)) → preFocus(\(resolved.id)) region=\(resolved.id)")
+                gazeInteractionTraceLog("[StateTransition] preFocus(\(region.id)) → preFocus(\(resolved.id)) region=\(resolved.id)")
                 let oldPF2 = focusState
                 focusState = .preFocus(resolved)
-                print(
+                gazeInteractionTraceLog(
                     "[Gate1-Transition] \(focusLabelForDiagnostics(oldPF2)) → \(focusLabelForDiagnostics(focusState)) category=\(resolved.colorCategory.rawValue)"
                 )
                 preFocusStartTime = now
@@ -564,9 +574,9 @@ final class GazeInteractionManager {
             let elapsedPre = now - start
             if now - start >= dwellDuration {
                 let oldPF3 = focusState
-                print("[StateTransition] preFocus(\(resolved.id)) → focused(\(resolved.id)) region=\(resolved.id)")
+                gazeInteractionTraceLog("[StateTransition] preFocus(\(resolved.id)) → focused(\(resolved.id)) region=\(resolved.id)")
                 focusState = .focused(resolved)
-                print(
+                gazeInteractionTraceLog(
                     "[Gate1-Transition] \(focusLabelForDiagnostics(oldPF3)) → \(focusLabelForDiagnostics(focusState)) category=\(resolved.colorCategory.rawValue)"
                 )
                 preFocusStartTime = nil
@@ -585,7 +595,7 @@ final class GazeInteractionManager {
                 overlayCategoryForFade = responseCategory ?? resolved.colorCategory
                 overlayTargetOpacity = 1
             } else {
-                print(
+                gazeInteractionTraceLog(
                     "[Gate1-Dwell] elapsed=\(elapsedPre) threshold=\(dwellDuration) region=\(resolved.entityName) category=\(resolved.colorCategory.rawValue)"
                 )
                 #if DEBUG
@@ -616,10 +626,10 @@ final class GazeInteractionManager {
 
             // Candidate differs: enter preFocus, but keep audio active
             // on the new preFocus candidate so the user hears the change immediately.
-            print("[StateTransition] focused(\(region.id)) → preFocus(\(resolved.id)) region=\(resolved.id)")
+            gazeInteractionTraceLog("[StateTransition] focused(\(region.id)) → preFocus(\(resolved.id)) region=\(resolved.id)")
             let oldF = focusState
             focusState = .preFocus(resolved)
-            print(
+            gazeInteractionTraceLog(
                 "[Gate1-Transition] \(focusLabelForDiagnostics(oldF)) → \(focusLabelForDiagnostics(focusState)) category=\(resolved.colorCategory.rawValue)"
             )
             preFocusStartTime = now
@@ -643,10 +653,10 @@ final class GazeInteractionManager {
             // After release, restart dwell.
             dwellSwitchStreakRegionId = nil
             dwellSwitchStreakCount = 0
-            print("[StateTransition] released → preFocus region=\(resolved.id)")
+            gazeInteractionTraceLog("[StateTransition] released → preFocus region=\(resolved.id)")
             let oldR = focusState
             focusState = .preFocus(resolved)
-            print(
+            gazeInteractionTraceLog(
                 "[Gate1-Transition] \(focusLabelForDiagnostics(oldR)) → \(focusLabelForDiagnostics(focusState)) category=\(resolved.colorCategory.rawValue)"
             )
             preFocusStartTime = now
