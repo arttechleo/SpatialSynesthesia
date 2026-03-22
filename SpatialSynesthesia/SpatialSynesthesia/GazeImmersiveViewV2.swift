@@ -124,6 +124,15 @@ final class PaintingSceneStateV2 {
     /// Throttles `[ColorGrade]` logging (update loop runs every frame).
     var lastColorGradePrintTime: CFTimeInterval = 0
 
+    // MARK: - Chapter 2 passthrough release fade (gaze leaves region)
+    var ch2ReleaseTimer: Float = 0
+    var ch2ReleasingFromRegion: PaintingRegion? = nil
+    /// Previous focus state for edge detection (tint / ColorMatch / stage logs).
+    var ch2PreviousFocusState: GazeInteractionManager.FocusState? = nil
+    var ch2LastStageLogKey: String = ""
+    /// Throttles `[Ch2-HexGrade]` (update loop runs every frame while focused).
+    var lastCh2HexGradeLogTime: CFTimeInterval = 0
+
     #if DEBUG
     /// Dedupe gaze `[EyeTrack]` / `[Sound]` / `[Perception]` logs (one set per applied `audioMixVersion`).
     var lastGazeDebugLoggedMixVersion: UInt64?
@@ -155,6 +164,9 @@ struct GazeImmersiveViewV2: View {
     @StateObject private var chapterController = ChapterController()
     @State private var orchestrator: SynesthesiaOrchestrator?
 
+    /// Fast fade to neutral when gaze leaves a focused region (Chapter 2 only).
+    private let ch2ReleaseDuration: Float = 0.35
+
     // Primary, supported passthrough tint via SurroundingsEffect.
     @State private var preferredSurroundingsEffectValue: SurroundingsEffect? = nil
 
@@ -180,9 +192,24 @@ struct GazeImmersiveViewV2: View {
             orchestrator?.isActive = true
             chapterController.begin()
             #if DEBUG
+            AuthoredPaintingRegion.kandinskyComposition.forEach { r in
+                print("[RegionMap] \(r.id) category=\(r.category) hex=\(r.hexColor)")
+            }
             Task {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                await MainActor.run { diagnoseColorGrade() }
+                await MainActor.run {
+                    ColorMappingAudit.auditColorMappings()
+                    Chapter1Score.auditScore()
+                    ColorMappingAudit.auditRegionMappings()
+                    diagnoseColorGrade()
+                }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                await MainActor.run {
+                    Chapter2ColorAudit.generateMismatchReport()
+                    Chapter2ColorAudit.testPaintingHexClassification()
+                }
             }
             #endif
         }
@@ -359,7 +386,7 @@ struct GazeImmersiveViewV2: View {
                 sceneState.sceneFromUpdateLoop = event.scene
 
                 let deltaTime = Float(event.deltaTime)
-                chapterController.tick()
+                chapterController.tick(deltaTime: TimeInterval(deltaTime))
                 if chapterController.currentChapter == .transitioning {
                     chapterController.updateTransitionBlend(deltaTime: deltaTime)
                 }
@@ -376,8 +403,10 @@ struct GazeImmersiveViewV2: View {
                         elapsed: chapterController.chapterOneElapsed,
                         deltaTime: deltaTime,
                         paintingRegions: AuthoredPaintingRegion.kandinskyComposition,
-                        applyColorGrade: { cat, intensity in
-                            self.applyPassthroughColorGrade(category: cat, intensity: intensity)
+                        applyAdditivePassthroughGrade: { r, g, b, energy, dominant in
+                            self.applyChapterOneAdditivePassthroughGrade(
+                                r: r, g: g, b: b, energy: energy, dominantFallback: dominant
+                            )
                         }
                     )
                 }
@@ -399,7 +428,14 @@ struct GazeImmersiveViewV2: View {
                     sceneState.lastAppliedAudioMixVersion = gazeManager.audioMixVersion
                 }
 
-                guard chapterController.currentChapter == .chapterTwo else { return }
+                chapterController.tickSignifier(deltaTime: deltaTime)
+                if let signifierColor = chapterController.signifierEffect {
+                    assignPreferredSurroundingsEffect(.colorMultiply(signifierColor))
+                    return
+                }
+
+                // Chapter 1 orchestrator runs above; this guard only skips gaze/Chapter 2 work.
+                guard chapterController.isChapterTwoInteractionLive else { return }
 
                 // 1) Update focus state: spatial pointer on `PaintingPlane` or head-ray fallback → authored zones.
                 let gazeCandidate = currentGazeCandidateRegion()
@@ -438,7 +474,7 @@ struct GazeImmersiveViewV2: View {
                 applyOverlayNow()
 
                 // 2b) Broad world tint wash driven by the same focus state machine.
-                updateWorldTintFromFocusState()
+                updateWorldTintFromFocusState(deltaTime: deltaTime)
 
                 // 3) Audio mix: apply every frame after intro so `.focused` / `.preFocus` stays in sync even when
                 //    `audioMixVersion` does not change (e.g. relaunch already focused). No category filtering.
@@ -890,54 +926,157 @@ struct GazeImmersiveViewV2: View {
 
     #if DEBUG
     private func diagnoseColorGrade() {
-        let additiveBoostFactor: CGFloat = 0.35
         for cat in KandinskyColorCategory.allCases {
             let color = cat.vividTintColor
             var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
             color.getRed(&r, green: &g, blue: &b, alpha: &a)
-            let intensity = cat.tintIntensity
-            let boost: CGFloat = 1.0 + CGFloat(intensity) * additiveBoostFactor
-            let fR = min(1.0, (1.0 - (1.0 - r) * CGFloat(intensity)) * (r > 0.5 ? boost : 1.0))
-            let fG = min(1.0, (1.0 - (1.0 - g) * CGFloat(intensity)) * (g > 0.5 ? boost : 1.0))
-            let fB = min(1.0, (1.0 - (1.0 - b) * CGFloat(intensity)) * (b > 0.5 ? boost : 1.0))
-            print("[GradeDiag] \(cat) intensity=\(intensity) finalRGB=(\(String(format: "%.2f", fR)),\(String(format: "%.2f", fG)),\(String(format: "%.2f", fB)))")
+            let strength = CGFloat(cat.tintIntensity)
+            let neutralR: CGFloat = 1.0
+            let neutralG: CGFloat = 1.0
+            let neutralB: CGFloat = 1.0
+            let fR = neutralR + (r - neutralR) * strength
+            let fG = neutralG + (g - neutralG) * strength
+            let fB = neutralB + (b - neutralB) * strength
+            print("[GradeDiag] \(cat) intensity=\(cat.tintIntensity) finalRGB=(\(String(format: "%.2f", fR)),\(String(format: "%.2f", fG)),\(String(format: "%.2f", fB)))")
         }
     }
     #endif
 
-    /// Sole mutator for `preferredSurroundingsEffectValue` (Chapter 1 score + Chapter 2 gaze).
-    private func applyPassthroughColorGrade(category: KandinskyColorCategory, intensity: Float) {
-        let additiveBoostFactor: CGFloat = 0.35
-        guard intensity > 0.02 else {
-            preferredSurroundingsEffectValue = nil
+    /// Boosts a painting color to its vivid equivalent for passthrough (preserves hue).
+    private func boostToVivid(r: Float, g: Float, b: Float) -> (r: Float, g: Float, b: Float) {
+        let maxC = max(r, g, b)
+        let minC = min(min(r, g), b)
+        let delta = maxC - minC
+        guard delta > 0.08 else { return (r, g, b) }
+        let scale = 1.0 / maxC
+        let boostedR = min(1.0, r * scale * 1.2)
+        let boostedG = min(1.0, g * scale * 1.2)
+        let boostedB = min(1.0, b * scale * 1.2)
+        return (boostedR, boostedG, boostedB)
+    }
+
+    /// Diagnostic: log every write to `preferredSurroundingsEffect` (via `preferredSurroundingsEffectValue`).
+    private func assignPreferredSurroundingsEffect(_ newValue: SurroundingsEffect?, file: StaticString = #file, line: UInt = #line) {
+        #if DEBUG
+        print("[EffectSet] \(file):\(line) value=\(String(describing: newValue))")
+        #endif
+        preferredSurroundingsEffectValue = newValue
+    }
+
+    /// Chapter 1: neutral-lerp `colorMultiply` from score-mixed vivid RGB (`SynesthesiaOrchestrator.additiveColorMix`).
+    private func applyChapterOneAdditivePassthroughGrade(
+        r: Float,
+        g: Float,
+        b: Float,
+        energy: Float,
+        dominantFallback: KandinskyColorCategory?
+    ) {
+        let minimumChapter1Strength: Float = 0.25
+        let effectiveStrength = max(minimumChapter1Strength, min(1.0, energy * 1.2))
+
+        let vivid = boostToVivid(r: r, g: g, b: b)
+        let isNearNeutral = vivid.r > 0.85 && vivid.g > 0.85 && vivid.b > 0.85
+        if isNearNeutral, let fallback = dominantFallback {
+            let color = fallback.vividTintColor
+            var fr: CGFloat = 0, fg: CGFloat = 0, fb: CGFloat = 0, fa: CGFloat = 0
+            color.getRed(&fr, green: &fg, blue: &fb, alpha: &fa)
+            let s = CGFloat(minimumChapter1Strength)
+            let neutralR: CGFloat = 1.0
+            let neutralG: CGFloat = 1.0
+            let neutralB: CGFloat = 1.0
+            let fR = neutralR + (fr - neutralR) * s
+            let fG = neutralG + (fg - neutralG) * s
+            let fB = neutralB + (fb - neutralB) * s
+            assignPreferredSurroundingsEffect(
+                .colorMultiply(
+                    Color(
+                        red: Double(max(0, min(1, fR))),
+                        green: Double(max(0, min(1, fG))),
+                        blue: Double(max(0, min(1, fB)))
+                    )
+                )
+            )
+            #if DEBUG
+            print("[Ch1-Fallback] near-neutral detected, using \(fallback)")
+            #endif
             return
         }
 
-        let color = category.vividTintColor
-        let strength = CGFloat(category.tintIntensity) * CGFloat(intensity)
+        let strength = CGFloat(effectiveStrength)
+        let neutralR: CGFloat = 1.0
+        let neutralG: CGFloat = 1.0
+        let neutralB: CGFloat = 1.0
+        let tr = CGFloat(vivid.r)
+        let tg = CGFloat(vivid.g)
+        let tb = CGFloat(vivid.b)
+        let finalR = neutralR + (tr - neutralR) * strength
+        let finalG = neutralG + (tg - neutralG) * strength
+        let finalB = neutralB + (tb - neutralB) * strength
 
-        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
-        color.getRed(&r, green: &g, blue: &b, alpha: &a)
+        #if DEBUG
+        print("[Ch1-Apply] strength=\(String(format: "%.2f", strength)) final=(\(String(format: "%.2f", finalR)),\(String(format: "%.2f", finalG)),\(String(format: "%.2f", finalB)))")
+        print("[Ch1-Apply] energy=\(String(format: "%.3f", energy)) r=\(String(format: "%.2f", r)) g=\(String(format: "%.2f", g)) b=\(String(format: "%.2f", b)) willSet=\(energy > 0.01)")
+        #endif
 
-        let boost: CGFloat = 1.0 + strength * additiveBoostFactor
+        assignPreferredSurroundingsEffect(
+            .colorMultiply(
+                Color(
+                    red: Double(max(0, min(1, finalR))),
+                    green: Double(max(0, min(1, finalG))),
+                    blue: Double(max(0, min(1, finalB)))
+                )
+            )
+        )
+    }
 
-        let finalR = min(1.0, (1.0 - (1.0 - r) * strength) * (r > 0.5 ? boost : 1.0))
-        let finalG = min(1.0, (1.0 - (1.0 - g) * strength) * (g > 0.5 ? boost : 1.0))
-        let finalB = min(1.0, (1.0 - (1.0 - b) * strength) * (b > 0.5 ? boost : 1.0))
+    /// Chapter 2 gaze path: vivid `colorMultiply` (boosted like Chapter 1; no animation).
+    private func applyPassthroughColorGrade(
+        category: KandinskyColorCategory,
+        intensity: Float,
+        ch2LogGradeDiagnostics: Bool = false
+    ) {
+        guard intensity > 0.01 else {
+            assignPreferredSurroundingsEffect(nil)
+            return
+        }
+
+        let strength = min(1.0, CGFloat(category.tintIntensity) * CGFloat(intensity) * 1.15)
+
+        let rawColor = category.vividTintColor
+        var rr: CGFloat = 0, rg: CGFloat = 0, rb: CGFloat = 0, ra: CGFloat = 0
+        rawColor.getRed(&rr, green: &rg, blue: &rb, alpha: &ra)
+
+        let vivid = boostToVivid(r: Float(rr), g: Float(rg), b: Float(rb))
+        let r = CGFloat(vivid.r)
+        let g = CGFloat(vivid.g)
+        let b = CGFloat(vivid.b)
+
+        #if DEBUG
+        if ch2LogGradeDiagnostics {
+            let fs = min(1.0, category.tintIntensity * intensity * 1.15)
+            print(
+                "[Ch2-Grade] category=\(category) intensity=\(intensity) tintIntensity=\(category.tintIntensity) finalStrength=\(fs)"
+            )
+        }
+        #endif
+
+        let finalR = 1.0 + (r - 1.0) * strength
+        let finalG = 1.0 + (g - 1.0) * strength
+        let finalB = 1.0 + (b - 1.0) * strength
 
         let gradeColor = Color(
-            red: Double(finalR),
-            green: Double(finalG),
-            blue: Double(finalB)
+            red: Double(max(0, min(1, finalR))),
+            green: Double(max(0, min(1, finalG))),
+            blue: Double(max(0, min(1, finalB)))
         )
 
-        preferredSurroundingsEffectValue = .colorMultiply(gradeColor)
+        assignPreferredSurroundingsEffect(.colorMultiply(gradeColor))
 
         let now = Date.timeIntervalSinceReferenceDate
         if now - sceneState.lastColorGradePrintTime > 1.0 {
             sceneState.lastColorGradePrintTime = now
-            print("[ColorGrade] cat=\(category) strength=\(String(format: "%.2f", intensity))")
             #if DEBUG
+            print("[ColorGrade] cat=\(category) strength=\(String(format: "%.2f", intensity))")
             print(
                 "[ColorGrade] dbg rgb=(\(String(format: "%.2f", finalR)),\(String(format: "%.2f", finalG)),\(String(format: "%.2f", finalB))) " +
                 "materialStrength=\(String(format: "%.2f", strength))"
@@ -945,24 +1084,207 @@ struct GazeImmersiveViewV2: View {
             #endif
         }
     }
+    /// Chapter 2: passthrough grade from the region's authored painting hex (boosted), not category→vivid alone.
+    private func applyChapter2GradeFromRegion(_ region: PaintingRegion, intensity: Float) {
+        guard intensity > 0.01 else {
+            assignPreferredSurroundingsEffect(nil)
+            return
+        }
 
-    private func updateWorldTintFromFocusState() {
+        let hex = region.hexColor
+        var s = hex.trimmingCharacters(in: .whitespaces)
+        if s.hasPrefix("#") { s = String(s.dropFirst()) }
+
+        let rgb: (r: Float, g: Float, b: Float)
+        if s.count == 6, let val = UInt64(s, radix: 16) {
+            rgb = (
+                r: Float((val >> 16) & 0xFF) / 255.0,
+                g: Float((val >> 8) & 0xFF) / 255.0,
+                b: Float(val & 0xFF) / 255.0
+            )
+        } else {
+            applyPassthroughColorGrade(
+                category: region.colorCategory,
+                intensity: intensity,
+                ch2LogGradeDiagnostics: false
+            )
+            return
+        }
+
+        let vivid = boostToVivid(r: rgb.r, g: rgb.g, b: rgb.b)
+        let maxC = max(vivid.r, vivid.g, vivid.b)
+        let minC = min(min(vivid.r, vivid.g), vivid.b)
+        let saturation = maxC > 0 ? (maxC - minC) / maxC : 0
+
+        let finalR: Float
+        let finalG: Float
+        let finalB: Float
+
+        if saturation < 0.25 {
+            let catColor = region.colorCategory.vividTintColor
+            var cr: CGFloat = 0, cg: CGFloat = 0, cb: CGFloat = 0, ca: CGFloat = 0
+            catColor.getRed(&cr, green: &cg, blue: &cb, alpha: &ca)
+            finalR = Float(cr)
+            finalG = Float(cg)
+            finalB = Float(cb)
+        } else {
+            finalR = vivid.r
+            finalG = vivid.g
+            finalB = vivid.b
+        }
+
+        let strength = min(
+            1.0,
+            Float(region.colorCategory.tintIntensity) * intensity * 1.15
+        )
+        let sc = CGFloat(strength)
+
+        let gradedR = 1.0 + (CGFloat(finalR) - 1.0) * sc
+        let gradedG = 1.0 + (CGFloat(finalG) - 1.0) * sc
+        let gradedB = 1.0 + (CGFloat(finalB) - 1.0) * sc
+
+        assignPreferredSurroundingsEffect(
+            .colorMultiply(
+                Color(
+                    red: Double(max(0, min(1, gradedR))),
+                    green: Double(max(0, min(1, gradedG))),
+                    blue: Double(max(0, min(1, gradedB)))
+                )
+            )
+        )
+
+        let nowHex = Date.timeIntervalSinceReferenceDate
+        if nowHex - sceneState.lastCh2HexGradeLogTime > 0.35 {
+            sceneState.lastCh2HexGradeLogTime = nowHex
+            print(
+                "[Ch2-HexGrade] region=\(region.id) hex=\(hex) vivid=(\(String(format: "%.2f", finalR)),\(String(format: "%.2f", finalG)),\(String(format: "%.2f", finalB))) strength=\(String(format: "%.2f", strength))"
+            )
+        }
+    }
+
+
+    private func ch2FocusStateLogKey(_ state: GazeInteractionManager.FocusState) -> String {
+        switch state {
+        case .noFocus: return "noFocus"
+        case .released: return "released"
+        case .preFocus(let r): return "preFocus:\(r.id)"
+        case .focused(let r): return "focused:\(r.id)"
+        }
+    }
+
+    private func ch2LogStageLineIfChanged(_ key: String, _ emit: () -> Void) {
+        if key != sceneState.ch2LastStageLogKey {
+            sceneState.ch2LastStageLogKey = key
+            emit()
+        }
+    }
+
+    private func updateWorldTintFromFocusState(deltaTime: Float) {
         guard let wash = sceneState.worldTintWashEntity else { return }
 
         ColorFilterOverlay.updateOverlay(wash, color: .clear)
 
-        switch gazeManager.focusState {
-        case .noFocus, .released:
-            // Neutral clear — not `.white` (avoids implying a white tint at rest).
-            applyPassthroughColorGrade(category: .gray, intensity: 0)
-        case .preFocus(let region):
-            let cat = gazeManager.responseCategory ?? region.colorCategory
-            applyPassthroughColorGrade(category: cat, intensity: 0.40)
-        case .focused(let region):
-            // Snap to full grade on the exact frame dwell completes (no animation / lerp).
-            let cat = gazeManager.responseCategory ?? region.colorCategory
-            applyPassthroughColorGrade(category: cat, intensity: 1.0)
+        let fs = gazeManager.focusState
+        let prev = sceneState.ch2PreviousFocusState
+
+        // Leaving focused for idle: begin fast release fade
+        if case .focused(let oldRegion) = prev {
+            switch fs {
+            case .noFocus, .released:
+                sceneState.ch2ReleasingFromRegion = oldRegion
+                sceneState.ch2ReleaseTimer = 0
+            default:
+                break
+            }
         }
+
+        // Focused → different region (no idle): cancel release, no cross-fade between regions
+        switch fs {
+        case .preFocus(let rNew):
+            if case .focused(let old)? = prev, old.id != rNew.id {
+                sceneState.ch2ReleasingFromRegion = nil
+                sceneState.ch2ReleaseTimer = 0
+            }
+        case .focused(let rNew):
+            if case .focused(let old)? = prev, old.id != rNew.id {
+                sceneState.ch2ReleasingFromRegion = nil
+                sceneState.ch2ReleaseTimer = 0
+            }
+        default:
+            break
+        }
+
+        // Dwelling again — cancel release fade
+        switch fs {
+        case .preFocus, .focused:
+            sceneState.ch2ReleasingFromRegion = nil
+            sceneState.ch2ReleaseTimer = 0
+        default:
+            break
+        }
+
+        // Release fade (only time-based transition in Chapter 2)
+        if let releasingRegion = sceneState.ch2ReleasingFromRegion {
+            sceneState.ch2ReleaseTimer += deltaTime
+            let t = min(1.0, sceneState.ch2ReleaseTimer / ch2ReleaseDuration)
+            let remainingIntensity = 1.0 - t
+            if remainingIntensity > 0.01 {
+                applyChapter2GradeFromRegion(releasingRegion, intensity: remainingIntensity)
+            } else {
+                assignPreferredSurroundingsEffect(nil)
+                sceneState.ch2ReleasingFromRegion = nil
+                sceneState.ch2ReleaseTimer = 0
+                print("[Ch2-Stage] RELEASED fade complete")
+            }
+            sceneState.ch2PreviousFocusState = fs
+            return
+        }
+
+        // Color match when focus is newly acquired (dwell complete or region switch)
+        if case .focused(let region) = fs {
+            let shouldLogMatch: Bool
+            switch prev {
+            case .none:
+                shouldLogMatch = true
+            case .some(.noFocus), .some(.released):
+                shouldLogMatch = true
+            case .some(.preFocus(let r)):
+                shouldLogMatch = r.id == region.id
+            case .some(.focused(let r)):
+                shouldLogMatch = r.id != region.id
+            }
+            if shouldLogMatch {
+                print(
+                    "[Ch2-ColorMatch] region=\(region.id) category=\(region.colorCategory) hex=\(region.hexColor) overlayWillBe=\(region.colorCategory.vividTintColor)"
+                )
+            }
+        }
+
+        switch fs {
+        case .noFocus, .released:
+            assignPreferredSurroundingsEffect(nil)
+            ch2LogStageLineIfChanged("NEUTRAL:\(ch2FocusStateLogKey(fs))") {
+                print("[Ch2-Stage] NEUTRAL")
+            }
+        case .preFocus(let region):
+            applyChapter2GradeFromRegion(region, intensity: 0.35)
+            ch2LogStageLineIfChanged("PREFOCUS:\(region.id)") {
+                print("[Ch2-Stage] PREFOCUS category=\(region.colorCategory) strength=0.35")
+            }
+        case .focused(let region):
+            applyChapter2GradeFromRegion(region, intensity: 1.0)
+            #if DEBUG
+            let gradeFS = min(1.0, region.colorCategory.tintIntensity * 1.0 * 1.15)
+            print(
+                "[Ch2-Grade] category=\(region.colorCategory) intensity=1.0 tintIntensity=\(region.colorCategory.tintIntensity) finalStrength=\(gradeFS)"
+            )
+            #endif
+            ch2LogStageLineIfChanged("FOCUSED:\(region.id)") {
+                print("[Ch2-Stage] FOCUSED category=\(region.colorCategory) strength=1.0")
+            }
+        }
+
+        sceneState.ch2PreviousFocusState = fs
     }
 
     private func handleTap(value: EntityTargetValue<SpatialTapGesture.Value>) {

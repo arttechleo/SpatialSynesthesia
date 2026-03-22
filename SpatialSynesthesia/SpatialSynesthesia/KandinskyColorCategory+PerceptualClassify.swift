@@ -53,12 +53,22 @@ extension KandinskyColorCategory {
             if H < 0 { H += 360 }
         }
 
+        // Cool blues (steel / cobalt): hue in blue range with modest saturation — not gray.
+        if S > 0.12 && H >= 195 && H <= 250 {
+            return .blue
+        }
+
+        // Warm tan / peach at low saturation: hue in orange band (not white/gray).
+        if S >= 0.08 && S < 0.25 && H >= 20 && H < 45 {
+            return .orange
+        }
+
         let cat: KandinskyColorCategory
         if S < 0.08 {
             if L > 0.88 { cat = .white }
             else if L > 0.18 { cat = .gray }
             else { cat = .black }
-        } else if S < 0.25 {
+        } else if S < 0.18 {
             if L > 0.82 { cat = .white }
             else if L < 0.18 { cat = .black }
             else if H >= 195 && H < 270 { cat = .blue }
@@ -68,7 +78,10 @@ extension KandinskyColorCategory {
             else if H >= 55 && H < 165 { cat = .green }
             else { cat = .gray }
         } else if S < 0.50 {
-            if H >= 340 || H < 20 { cat = .red }
+            // Muted / dusty rose & warm pinks: low chroma + light → orange family, not fire red
+            if S < 0.34 && L > 0.50 && (H < 24 || H > 336) {
+                cat = .orange
+            } else if H >= 340 || H < 20 { cat = .red }
             else if H >= 20 && H < 50 { cat = .orange }
             else if H >= 50 && H < 80 { cat = .yellow }
             else if H >= 80 && H < 165 { cat = .green }
@@ -85,6 +98,13 @@ extension KandinskyColorCategory {
         else if H >= 255 && H < 295 { cat = .violet }
         else if H >= 295 && H < 345 { cat = .violet }
         else { cat = .gray }
+
+        // Cream / warm paper: high lightness, moderate chroma, yellow hue → reads as white in context
+        if L > 0.82 && S < 0.55 && H >= 45 && H < 100 {
+            if cat == .yellow || cat == .green {
+                return .white
+            }
+        }
 
         if cat == .red && L > 0.72 { return .white }
         return cat
@@ -127,7 +147,7 @@ enum PerceptualColorClassificationSelfTest {
             ("#FFD700", .yellow), ("#F4C430", .yellow), ("#FFF176", .yellow),
             ("#E6B800", .yellow),
             ("#1E5A8C", .blue), ("#0D3B66", .blue), ("#4A90E2", .blue),
-            ("#87CEEB", .green), ("#2C3E50", .blue),
+            ("#87CEEB", .blue), ("#2C3E50", .blue),
             ("#2E8B57", .green), ("#6B8E23", .green), ("#98FB98", .green),
             ("#3CB371", .green),
             ("#6A0DAD", .violet), ("#8A2BE2", .violet), ("#9370DB", .violet),

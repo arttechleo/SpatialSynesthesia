@@ -20,6 +20,12 @@
 		};
 /* End PBXContainerItemProxy section */
 
+/* Begin PBXFileReference section */
+		3F4C700E2F64F15600D82D35 /* SpatialSynesthesia.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SpatialSynesthesia.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		3F4C70122F64F15600D82D35 /* RealityKitContent */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = RealityKitContent; sourceTree = "<group>"; };
+		3F4C70222F64F15700D82D35 /* SpatialSynesthesiaTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SpatialSynesthesiaTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
 		3F4C70402F64F15700D82D35 /* Exceptions for "SpatialSynesthesia" folder in "SpatialSynesthesia" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
@@ -29,12 +35,6 @@
 			target = 3F4C700D2F64F15600D82D35 /* SpatialSynesthesia */;
 		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
-
-/* Begin PBXFileReference section */
-		3F4C700E2F64F15600D82D35 /* SpatialSynesthesia.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = SpatialSynesthesia.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		3F4C70122F64F15600D82D35 /* RealityKitContent */ = {isa = PBXFileReference; lastKnownFileType = wrapper; path = RealityKitContent; sourceTree = "<group>"; };
-		3F4C70222F64F15700D82D35 /* SpatialSynesthesiaTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = SpatialSynesthesiaTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-/* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		3F4C70102F64F15600D82D35 /* SpatialSynesthesia */ = {

@@ -7,6 +7,7 @@
 
 import RealityKit
 import SwiftUI
+import UIKit
 
 /// How optional Chapter 1 region highlight meshes behave (thin emissive boxes on the painting plane).
 /// Passthrough color grading is unchanged for all modes.
@@ -42,16 +43,20 @@ final class SynesthesiaOrchestrator {
 
     private weak var audioManager: AudioManager?
     private let analyzer = StemAmplitudeAnalyzer()
+    private let sequencer = BeatColorSequencer()
 
     private var highlightEntities: [String: RegionHighlightEntity] = [:]
     private var didSetupHighlights = false
     private var didLogRegionIds = false
 
-    private var lastScoreLogTime: TimeInterval = 0
-    private var lastCh1GradeLogTime: TimeInterval = 0
+    /// Dedupes `[Ch1-Pipeline]` logs on even integer seconds of elapsed time.
+    private var lastScoreLogSecond: Int = -1
 
     /// Tracks which score keyframe segment we have entered (for rhythmic pulse on phrase boundaries).
     private var lastKeyframeIndex: Int = -1
+
+    /// Throttles `[Ch1-Diagnostic]` logs to every 3 seconds.
+    private var diagnosticTimer: Float = 0
 
     init(audioManager: AudioManager) {
         self.audioManager = audioManager
@@ -66,8 +71,10 @@ final class SynesthesiaOrchestrator {
         }
         guard highestIndex > lastKeyframeIndex else { return false }
         lastKeyframeIndex = highestIndex
+        #if DEBUG
         let t = frames[highestIndex].time
         print("[Rhythm] keyframe crossed index=\(highestIndex) time=\(t)")
+        #endif
         return true
     }
 
@@ -114,43 +121,36 @@ final class SynesthesiaOrchestrator {
         #endif
     }
 
-    /// Severance-style: one dominant color owns the room; optional secondary at reduced weight.
-    /// Tie-break uses `rawValue` so `.yellow` / `.blue` do not win arbitrarily from enum order.
-    func applyDominantColorGrade(
-        intensities: [KandinskyColorCategory: Float],
-        applyGrade: (KandinskyColorCategory, Float) -> Void
+    /// Weighted mix of `vividTintColor` channels from score-driven intensities (threshold 0.001).
+    static func additiveColorMix(intensities: [KandinskyColorCategory: Float]) -> (
+        r: Float,
+        g: Float,
+        b: Float,
+        energy: Float,
+        totalEnergy: Float
     ) {
-        let sorted = intensities
-            .filter { $0.value > 0.05 }
-            .sorted { lhs, rhs in
-                if lhs.value != rhs.value { return lhs.value > rhs.value }
-                return lhs.key.rawValue < rhs.key.rawValue
-            }
-
-        guard let dominant = sorted.first else {
-            // Clear passthrough — category unused at intensity 0; `.gray` avoids vivid default bias.
-            applyGrade(.gray, 0.0)
-            return
+        var r: Float = 0
+        var g: Float = 0
+        var b: Float = 0
+        var weightSum: Float = 0
+        for (cat, intensity) in intensities {
+            guard intensity > 0.001 else { continue }
+            var cr: CGFloat = 0, cg: CGFloat = 0, cb: CGFloat = 0, a: CGFloat = 0
+            cat.vividTintColor.getRed(&cr, green: &cg, blue: &cb, alpha: &a)
+            let w = intensity
+            r += Float(cr) * w
+            g += Float(cg) * w
+            b += Float(cb) * w
+            weightSum += w
         }
-
-        if let secondary = sorted.dropFirst().first {
-            let secondaryContribution = secondary.value * 0.30
-            let blendedCategory = dominant.value > secondaryContribution
-                ? dominant.key
-                : secondary.key
-            let blendedIntensity = min(1.0, dominant.value + secondaryContribution * 0.3)
-            applyGrade(blendedCategory, blendedIntensity)
-        } else {
-            applyGrade(dominant.key, dominant.value)
+        guard weightSum > 1e-5 else {
+            return (0, 0, 0, 0, 0)
         }
-
-        let now = Date().timeIntervalSinceReferenceDate
-        if now - lastCh1GradeLogTime > 2.0 {
-            lastCh1GradeLogTime = now
-            #if DEBUG
-            print("[Ch1-Grade] dominant=\(dominant.key) intensity=\(String(format: "%.2f", dominant.value))")
-            #endif
-        }
+        r /= weightSum
+        g /= weightSum
+        b /= weightSum
+        let totalEnergy = min(1.0, weightSum)
+        return (r, g, b, totalEnergy, totalEnergy)
     }
 
     /// Call every frame from SceneEvents.Update when `isActive` is true.
@@ -158,7 +158,7 @@ final class SynesthesiaOrchestrator {
         elapsed: TimeInterval,
         deltaTime: Float,
         paintingRegions _: [AuthoredPaintingRegion],
-        applyColorGrade: (KandinskyColorCategory, Float) -> Void
+        applyAdditivePassthroughGrade: @escaping (Float, Float, Float, Float, KandinskyColorCategory?) -> Void
     ) {
         guard isActive else { return }
         _ = audioManager
@@ -170,6 +170,20 @@ final class SynesthesiaOrchestrator {
 
         analyzer.updateFromScore(elapsed: elapsed, deltaTime: deltaTime)
 
+        let elapsedTime = elapsed
+        #if DEBUG
+        if Int(elapsedTime) % 2 == 0 && Int(elapsedTime) != lastScoreLogSecond {
+            lastScoreLogSecond = Int(elapsedTime)
+            let top = analyzer.intensities
+                .filter { $0.value > 0.01 }
+                .sorted { $0.value > $1.value }
+                .prefix(3)
+                .map { "\($0.key):\(String(format: "%.2f", $0.value))" }
+                .joined(separator: " ")
+            print("[Ch1-Pipeline] elapsed=\(String(format: "%.1f", elapsedTime)) intensities=[\(top)]")
+        }
+        #endif
+
         var modulation: [KandinskyColorCategory: Float] = [:]
         for cat in KandinskyColorCategory.allCases {
             let raw = analyzer.intensities[cat] ?? 0.0
@@ -178,9 +192,30 @@ final class SynesthesiaOrchestrator {
 
         updateHighlights(intensities: modulation, deltaTime: deltaTime, displayMode: regionHighlightDisplayMode)
 
-        logScoreIfNeeded(elapsed: elapsed)
+        #if DEBUG
+        diagnosticTimer += deltaTime
+        if diagnosticTimer >= 3.0 {
+            diagnosticTimer = 0
+            let active = analyzer.intensities
+                .filter { $0.value > 0.02 }
+                .sorted { $0.value > $1.value }
+                .map { "\($0.key)=\(String(format: "%.2f", $0.value))" }
+                .joined(separator: " ")
+            let mixed = Self.additiveColorMix(intensities: modulation)
+            print("[Ch1-Diagnostic] elapsed=\(String(format: "%.1f", elapsedTime)) active=[\(active.isEmpty ? "NONE" : active)] energy=\(String(format: "%.3f", mixed.totalEnergy))")
+        }
+        #endif
 
-        applyDominantColorGrade(intensities: modulation, applyGrade: applyColorGrade)
+        let mixed = Self.additiveColorMix(intensities: modulation)
+        sequencer.update(deltaTime: deltaTime, musicalEnergy: mixed.totalEnergy)
+        let seqRGB = sequencer.blendedRGB
+        applyAdditivePassthroughGrade(
+            seqRGB.r,
+            seqRGB.g,
+            seqRGB.b,
+            max(mixed.totalEnergy, 0.25),
+            analyzer.dominantCategory
+        )
     }
 
     func modulationColor(for region: AuthoredPaintingRegion,
@@ -251,15 +286,4 @@ final class SynesthesiaOrchestrator {
         return base * 0.5
     }
 
-    private func logScoreIfNeeded(elapsed: TimeInterval) {
-        let now = Date().timeIntervalSinceReferenceDate
-        guard now - lastScoreLogTime > 2.0 else { return }
-        lastScoreLogTime = now
-        #if DEBUG
-        if let dominant = analyzer.dominantCategory {
-            let intensity = analyzer.intensities[dominant] ?? 0
-            print("[Ch1-Score] elapsed=\(String(format: "%.1f", elapsed)) dominant=\(dominant) intensity=\(String(format: "%.2f", intensity))")
-        }
-        #endif
-    }
 }

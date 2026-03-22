@@ -65,7 +65,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(-0.20, 0, 0.28),
                 localSize: SIMD3(0.32, ySlab, 0.36),
                 hexColor: "#405D87",
-                category: .violet,
+                category: KandinskyColorCategory.classify(hex: "#405D87"),
                 priority: 52
             ),
             AuthoredPaintingRegion(
@@ -73,7 +73,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(-0.26, 0, 0.02),
                 localSize: SIMD3(0.24, ySlab, 0.38),
                 hexColor: "#94A5B6",
-                category: .blue,
+                category: KandinskyColorCategory.classify(hex: "#94A5B6"),
                 priority: 48
             ),
             AuthoredPaintingRegion(
@@ -81,7 +81,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(-0.22, 0, -0.30),
                 localSize: SIMD3(0.28, ySlab, 0.26),
                 hexColor: "#D1B646",
-                category: .yellow,
+                category: KandinskyColorCategory.classify(hex: "#D1B646"),
                 priority: 50
             ),
             AuthoredPaintingRegion(
@@ -89,7 +89,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(-0.12, 0, 0.06),
                 localSize: SIMD3(0.22, ySlab, 0.30),
                 hexColor: "#CEC6B8",
-                category: .gray,
+                category: KandinskyColorCategory.classify(hex: "#CEC6B8"),
                 priority: 56
             ),
             AuthoredPaintingRegion(
@@ -97,7 +97,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0.02, 0, 0.08),
                 localSize: SIMD3(0.30, ySlab, 0.34),
                 hexColor: "#B1100F",
-                category: .red,
+                category: KandinskyColorCategory.classify(hex: "#B1100F"),
                 priority: 72
             ),
             AuthoredPaintingRegion(
@@ -105,7 +105,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0.08, 0, 0.30),
                 localSize: SIMD3(0.32, ySlab, 0.24),
                 hexColor: "#F1ECE5",
-                category: .white,
+                category: KandinskyColorCategory.classify(hex: "#F1ECE5"),
                 priority: 54
             ),
             AuthoredPaintingRegion(
@@ -113,7 +113,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0.24, 0, 0.04),
                 localSize: SIMD3(0.26, ySlab, 0.34),
                 hexColor: "#405D87",
-                category: .blue,
+                category: KandinskyColorCategory.classify(hex: "#405D87"),
                 priority: 49
             ),
             AuthoredPaintingRegion(
@@ -121,7 +121,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0.20, 0, -0.28),
                 localSize: SIMD3(0.30, ySlab, 0.26),
                 hexColor: "#4D594D",
-                category: .green,
+                category: KandinskyColorCategory.classify(hex: "#4D594D"),
                 priority: 47
             ),
             // Gap-fillers (priority 2): upper canvas + far right; specific regions above override via higher priority.
@@ -130,7 +130,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0.30, 0.0, 0.45),
                 localSize: SIMD3(0.40, ySlab, 0.40),
                 hexColor: "#94A5B6",
-                category: .blue,
+                category: KandinskyColorCategory.classify(hex: "#94A5B6"),
                 priority: 2
             ),
             AuthoredPaintingRegion(
@@ -138,7 +138,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0.02, 0.0, 0.50),
                 localSize: SIMD3(0.25, ySlab, 0.30),
                 hexColor: "#F1ECE5",
-                category: .white,
+                category: KandinskyColorCategory.classify(hex: "#F1ECE5"),
                 priority: 2
             ),
             AuthoredPaintingRegion(
@@ -146,7 +146,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0.44, 0.0, 0.08),
                 localSize: SIMD3(0.30, ySlab, 0.35),
                 hexColor: "#405D87",
-                category: .blue,
+                category: KandinskyColorCategory.classify(hex: "#405D87"),
                 priority: 2
             ),
             AuthoredPaintingRegion(
@@ -154,7 +154,7 @@ struct AuthoredPaintingRegion: Equatable {
                 localCenter: SIMD3(0, 0, 0),
                 localSize: SIMD3(1.20, ySlab, 1.40),
                 hexColor: "#EDE7C9",
-                category: .white,
+                category: KandinskyColorCategory.classify(hex: "#EDE7C9"),
                 priority: 0
             )
         ]
@@ -166,7 +166,7 @@ struct AuthoredPaintingRegion: Equatable {
         localCenter: SIMD3(0.0, 0.0, 0.0),
         localSize: SIMD3(2.0, 0.12, 2.0),
         hexColor: "#EDE7C9",
-        category: .white,
+        category: KandinskyColorCategory.classify(hex: "#EDE7C9"),
         priority: 0
     )
 

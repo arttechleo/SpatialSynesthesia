@@ -36,9 +36,26 @@ final class ChapterController: ObservableObject {
     // Crossfade from Chapter 1 modulation to Chapter 2 gaze system
     let transitionDuration: TimeInterval = 4.0
 
-    private var chapterOneStartTime: Date?
+    /// Seconds since Chapter 1 began; incremented in `tick(deltaTime:)` while in `.chapterOne` or `.transitioning`.
+    private(set) var chapterOneElapsed: TimeInterval = 0
+
     private var cancellables = Set<AnyCancellable>()
     private var transitionBlend: Float = 1.0
+
+    /// Chapter 2 entry signifier: 0 = inactive, 1 = complete.
+    private(set) var signifierPhase: Float = 0
+    private var signifierActive: Bool = false
+    private var signifierElapsed: Float = 0
+
+    let signifierFlashDuration: Float = 0.15
+    let signifierBlackDuration: Float = 0.40
+    let signifierFadeInDuration: Float = 1.20
+    let signifierTotalDuration: Float = 1.75
+
+    #if DEBUG
+    /// Dedupes `[Ch1-Elapsed]` logs (once per integer second).
+    private var lastElapsedLogSecond: Int = -1
+    #endif
 
     func begin() {
         currentChapter = .fadingIn
@@ -47,19 +64,29 @@ final class ChapterController: ObservableObject {
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + fadeInDuration) {
             self.currentChapter = .chapterOne
-            self.chapterOneStartTime = Date()
+            self.chapterOneElapsed = 0
             #if DEBUG
+            self.lastElapsedLogSecond = -1
             print("[Chapter] chapterOne began at \(Date())")
             #endif
         }
     }
 
-    /// Called every frame from SceneEvents.Update to check chapter timing.
-    func tick() {
-        guard currentChapter == .chapterOne,
-              let start = chapterOneStartTime else { return }
-        let elapsed = Date().timeIntervalSince(start)
-        if elapsed >= chapterOneDuration {
+    /// Called every frame from SceneEvents.Update to advance Chapter 1 time and check duration.
+    func tick(deltaTime: TimeInterval) {
+        if currentChapter == .chapterOne || currentChapter == .transitioning {
+            chapterOneElapsed += deltaTime
+            #if DEBUG
+            let sec = Int(floor(chapterOneElapsed))
+            if sec != lastElapsedLogSecond {
+                lastElapsedLogSecond = sec
+                print("[Ch1-Elapsed] \(String(format: "%.1f", chapterOneElapsed))s chapter=\(currentChapter)")
+            }
+            #endif
+        }
+
+        guard currentChapter == .chapterOne else { return }
+        if chapterOneElapsed >= chapterOneDuration {
             beginTransitionToChapterTwo()
         }
     }
@@ -68,9 +95,46 @@ final class ChapterController: ObservableObject {
         guard currentChapter == .chapterOne else { return }
         currentChapter = .transitioning
         transitionBlend = 1.0
+        beginChapterTwoSignifier()
         #if DEBUG
         print("[Chapter] transitioning to chapterTwo")
         #endif
+    }
+
+    func beginChapterTwoSignifier() {
+        signifierActive = true
+        signifierElapsed = 0
+        signifierPhase = 0
+        print("[Signifier] chapter two entry signifier began")
+    }
+
+    func tickSignifier(deltaTime: Float) {
+        guard signifierActive else { return }
+        signifierElapsed += deltaTime
+        signifierPhase = min(1.0, signifierElapsed / signifierTotalDuration)
+        if signifierPhase >= 1.0 {
+            signifierActive = false
+            print("[Signifier] complete")
+        }
+    }
+
+    /// `colorMultiply` during the signifier; `nil` when inactive.
+    var signifierEffect: Color? {
+        guard signifierActive else { return nil }
+        let t = signifierElapsed
+
+        if t < signifierFlashDuration {
+            let p = t / signifierFlashDuration
+            let v = Double(p)
+            return Color(red: v, green: v, blue: v)
+        } else if t < signifierFlashDuration + signifierBlackDuration {
+            return Color(red: 0.03, green: 0.03, blue: 0.05)
+        } else {
+            let fadeElapsed = t - signifierFlashDuration - signifierBlackDuration
+            let p = Double(min(1.0, fadeElapsed / signifierFadeInDuration))
+            let v = 0.03 + 0.97 * p
+            return Color(red: v, green: v, blue: v)
+        }
     }
 
     /// Call every frame during .transitioning state to animate chapterOneBlend.
@@ -85,9 +149,22 @@ final class ChapterController: ObservableObject {
         }
     }
 
-    /// Whether Chapter 1 modulation should be running.
+    /// Whether Chapter 1 modulation should be running (stops once the Ch2 entry signifier completes).
     var isChapterOneActive: Bool {
-        currentChapter == .chapterOne || currentChapter == .transitioning
+        switch currentChapter {
+        case .chapterOne: return true
+        case .transitioning: return signifierPhase < 1.0
+        default: return false
+        }
+    }
+
+    /// Chapter 2 gaze path runs after the signifier completes, even while the Ch1→Ch2 crossfade continues.
+    var isChapterTwoInteractionLive: Bool {
+        switch currentChapter {
+        case .chapterTwo: return true
+        case .transitioning: return signifierPhase >= 1.0
+        default: return false
+        }
     }
 
     /// Blend factor for Chapter 1 modulation (1.0=full, 0.0=none).
@@ -99,11 +176,5 @@ final class ChapterController: ObservableObject {
         case .chapterTwo:    return 0.0
         default:             return 0.0
         }
-    }
-
-    /// Seconds since Chapter 1 began (after fade-in). Used by `Chapter1Score`.
-    var chapterOneElapsed: TimeInterval {
-        guard let start = chapterOneStartTime else { return 0 }
-        return Date().timeIntervalSince(start)
     }
 }
