@@ -18,25 +18,49 @@ final class ChapterController: ObservableObject {
     enum Chapter {
         case blackout          // pre-start, fully dark
         case fadingIn          // fade from black to passthrough
+        case reveal            // painting emerges from dark; regions light sequentially
         case chapterOne        // music drives visual modulation
         case transitioning     // crossfade from ch1 to ch2
         case chapterTwo        // existing gaze interaction system
     }
 
     @Published var currentChapter: Chapter = .blackout
-    @Published var fadeOpacity: Double = 1.0  // 1=black, 0=transparent
+
+    /// Elapsed time in `.fadingIn` (passthrough brightening driven in `tick`, not SwiftUI animation).
+    private(set) var fadeElapsed: TimeInterval = 0
 
     // Chapter 1 duration before auto-transitioning to Chapter 2.
     // The symphony should complete at least one full musical phrase.
     let chapterOneDuration: TimeInterval = 90.0  // adjust to music length
 
     // Fade in from black duration
-    let fadeInDuration: TimeInterval = 3.0
+    let fadeInDuration: TimeInterval = 2.0
 
     // Crossfade from Chapter 1 modulation to Chapter 2 gaze system
     let transitionDuration: TimeInterval = 4.0
 
-    /// Seconds since Chapter 1 began; incremented in `tick(deltaTime:)` while in `.chapterOne` or `.transitioning`.
+    // MARK: - Reveal sequence (between fade-in and Chapter 1)
+
+    /// Total duration of the reveal sequence.
+    let revealDuration: TimeInterval = 6.0
+
+    /// Silhouette-only phase before color regions begin appearing.
+    let silhouetteDuration: TimeInterval = 1.2
+
+    /// How dark the passthrough world is at the start of reveal (multiply baseline).
+    /// 0.0 = black, 1.0 = full brightness.
+    let revealWorldDarkness: Float = 0.06
+
+    /// Passthrough brightens by this much (added to `revealWorldDarkness`) by end of reveal.
+    let revealWorldLightenRange: Float = 0.06
+
+    private(set) var revealElapsed: TimeInterval = 0
+    private var lastRevealLogSecond: Int = -1
+
+    /// Invoked once when entering `.reveal` (e.g. reset highlight intensities).
+    var onRevealBegan: (() -> Void)?
+
+    /// Seconds since Chapter 1 began; incremented in `tick` while in `.chapterOne` or `.transitioning`.
     private(set) var chapterOneElapsed: TimeInterval = 0
 
     private var cancellables = Set<AnyCancellable>()
@@ -57,25 +81,80 @@ final class ChapterController: ObservableObject {
     private var lastElapsedLogSecond: Int = -1
     #endif
 
-    func begin() {
-        currentChapter = .fadingIn
-        withAnimation(.easeIn(duration: fadeInDuration)) {
-            fadeOpacity = 0.0
+    /// 0.0 = reveal just started (near black, no painting)
+    /// ~0.2 = silhouette visible, no color regions yet (1.2 / 6)
+    /// 1.0 = all regions revealed, ready for Chapter 1
+    var revealPhase: Float {
+        guard currentChapter == .reveal else {
+            return currentChapter == .blackout || currentChapter == .fadingIn
+                ? 0.0 : 1.0
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + fadeInDuration) {
-            self.currentChapter = .chapterOne
-            self.chapterOneElapsed = 0
-            #if DEBUG
-            self.lastElapsedLogSecond = -1
-            print("[Chapter] chapterOne began at \(Date())")
-            #endif
-        }
+        return Float(min(1.0, revealElapsed / revealDuration))
     }
 
-    /// Called every frame from SceneEvents.Update to advance Chapter 1 time and check duration.
-    func tick(deltaTime: TimeInterval) {
-        if currentChapter == .chapterOne || currentChapter == .transitioning {
-            chapterOneElapsed += deltaTime
+    /// 0.0 = silhouette only, 1.0 = all regions visible (within reveal timeline).
+    var regionRevealPhase: Float {
+        let silhouetteEnd = Float(silhouetteDuration / revealDuration)
+        guard revealPhase > silhouetteEnd else { return 0.0 }
+        return min(1.0, (revealPhase - silhouetteEnd) / (1.0 - silhouetteEnd))
+    }
+
+    var isRevealActive: Bool {
+        currentChapter == .reveal
+    }
+
+    /// Grayscale `colorMultiply` during `.fadingIn`: black → `revealWorldDarkness` (replaces SwiftUI fade overlay).
+    var fadingInPassthroughBrightness: Float {
+        if currentChapter == .blackout { return 0 }
+        guard currentChapter == .fadingIn else { return revealWorldDarkness }
+        let t = fadeInDuration > 0 ? min(1.0, Float(fadeElapsed / fadeInDuration)) : 1.0
+        return t * revealWorldDarkness
+    }
+
+    func begin() {
+        currentChapter = .fadingIn
+        fadeElapsed = 0
+    }
+
+    func beginChapterOne() {
+        currentChapter = .chapterOne
+        chapterOneElapsed = 0
+        #if DEBUG
+        lastElapsedLogSecond = -1
+        #endif
+        print("[Chapter] chapterOne began — reveal complete")
+    }
+
+    /// Called every frame from SceneEvents.Update to advance chapter timers.
+    func tick(deltaTime: Float) {
+        let dt = TimeInterval(deltaTime)
+
+        switch currentChapter {
+
+        case .fadingIn:
+            fadeElapsed += dt
+            if fadeElapsed >= fadeInDuration {
+                currentChapter = .reveal
+                revealElapsed = 0
+                lastRevealLogSecond = -1
+                fadeElapsed = 0
+                onRevealBegan?()
+                print("[Chapter] fadingIn complete → reveal")
+            }
+
+        case .reveal:
+            revealElapsed += dt
+            let s = Int(revealElapsed)
+            if s != lastRevealLogSecond {
+                lastRevealLogSecond = s
+                print("[Reveal] elapsed=\(s)s phase=\(revealPhase)")
+            }
+            if revealElapsed >= revealDuration {
+                beginChapterOne()
+            }
+
+        case .chapterOne, .transitioning:
+            chapterOneElapsed += dt
             #if DEBUG
             let sec = Int(floor(chapterOneElapsed))
             if sec != lastElapsedLogSecond {
@@ -83,6 +162,9 @@ final class ChapterController: ObservableObject {
                 print("[Ch1-Elapsed] \(String(format: "%.1f", chapterOneElapsed))s chapter=\(currentChapter)")
             }
             #endif
+
+        default:
+            break
         }
 
         guard currentChapter == .chapterOne else { return }
@@ -149,7 +231,7 @@ final class ChapterController: ObservableObject {
         }
     }
 
-    /// Whether Chapter 1 modulation should be running (stops once the Ch2 entry signifier completes).
+    /// Full Chapter 1 color cycling (excludes `.reveal`; signifier still gates end of Ch1 modulation during transition).
     var isChapterOneActive: Bool {
         switch currentChapter {
         case .chapterOne: return true

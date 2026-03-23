@@ -13,10 +13,9 @@ import SwiftUI
 
 // MARK: - Scene state (holds entity refs for update closure)
 
-/// Holds references to canvas entities so RealityView update can refresh the overlay.
+/// Holds references to canvas entities for tap → region resolution.
 @Observable
 final class GazeImmersiveSceneState {
-    var overlayEntity: Entity?
     var regionByEntityName: [String: PaintingRegion] = [:]
 }
 
@@ -31,8 +30,6 @@ struct GazeImmersiveView: View {
     var body: some View {
         RealityView { content in
             await setupScene(content: content)
-        } update: { content in
-            updateOverlayIfNeeded()
         }
         .gesture(
             SpatialTapGesture()
@@ -49,17 +46,11 @@ struct GazeImmersiveView: View {
         content.add(root)
         root.addChild(result.root)
 
-        sceneState.overlayEntity = result.overlayEntity
         sceneState.regionByEntityName = result.regionByEntityName
 
         #if DEBUG
         print("[GazeImmersiveView] Canvas ready; \(result.regions.count) regions")
         #endif
-    }
-
-    private func updateOverlayIfNeeded() {
-        guard let overlay = sceneState.overlayEntity as? ModelEntity else { return }
-        ColorFilterOverlay.updateOverlay(overlay, category: gazeManager.activeCategory)
     }
 
     private func handleTap(value: EntityTargetValue<SpatialTapGesture.Value>) {

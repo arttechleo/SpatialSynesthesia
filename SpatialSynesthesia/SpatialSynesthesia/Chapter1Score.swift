@@ -17,6 +17,16 @@ struct Chapter1ScoreEntry {
     let prominences: [KandinskyColorCategory: Float]  // 0–1 per category
 }
 
+/// One step in the pre–Chapter 1 reveal: which region lights when (by `regionRevealPhase`).
+struct RegionRevealEntry {
+    /// 0.0–1.0 in `regionRevealPhase` when this region begins to appear (ascending order).
+    let revealAt: Float
+    let category: KandinskyColorCategory
+    /// Must match `AuthoredPaintingRegion.kandinskyComposition` id (see `[RevealSetup]` logs).
+    let regionId: String
+    let peakIntensity: Float
+}
+
 struct Chapter1Score {
 
     /// Hex colors sampled from the Kandinsky painting (with semantic category for score/fallback).
@@ -57,6 +67,35 @@ struct Chapter1Score {
             b: Float(val & 0xFF) / 255.0
         )
     }
+
+    /// Ordered reveal steps after the silhouette phase (`regionRevealPhase` 0 → 1).
+    /// `regionId` values match `AuthoredPaintingRegion.kandinskyComposition`.
+    static let regionRevealSequence: [RegionRevealEntry] = [
+        .init(revealAt: 0.00, category: .blue,   regionId: "authored_left_blue_triangle",   peakIntensity: 0.95),
+        .init(revealAt: 0.18, category: .violet, regionId: "authored_top_left_circle",     peakIntensity: 0.90),
+        .init(revealAt: 0.34, category: .yellow, regionId: "authored_bottom_left_yellow",  peakIntensity: 0.92),
+        .init(revealAt: 0.47, category: .green,  regionId: "authored_bottom_right_green",  peakIntensity: 0.85),
+        .init(revealAt: 0.57, category: .gray,   regionId: "authored_center_left_checker", peakIntensity: 0.72),
+        .init(revealAt: 0.66, category: .red,    regionId: "authored_central_cluster",     peakIntensity: 0.95),
+        .init(revealAt: 0.74, category: .white,  regionId: "authored_upper_center_shapes", peakIntensity: 0.78),
+        .init(revealAt: 0.83, category: .blue,   regionId: "authored_right_blue_circle",    peakIntensity: 0.88),
+        .init(revealAt: 0.92, category: .white,  regionId: "authored_background",          peakIntensity: 0.65),
+    ]
+
+    #if DEBUG
+    /// Logs composition ids and flags any `regionRevealSequence` id not in `kandinskyComposition`.
+    static func logRevealSetupAndVerifyRegionIds() {
+        let compositionIds = Set(AuthoredPaintingRegion.kandinskyComposition.map(\.id))
+        AuthoredPaintingRegion.kandinskyComposition.forEach {
+            print("[RevealSetup] id=\($0.id) category=\($0.category)")
+        }
+        for entry in regionRevealSequence {
+            if !compositionIds.contains(entry.regionId) {
+                print("[RevealSetup] MISMATCH regionId=\(entry.regionId) not in kandinskyComposition")
+            }
+        }
+    }
+    #endif
 
     #if DEBUG
     /// Dedupes `[Ch1-Score]` prominence logs (once per integer second of `elapsed`).

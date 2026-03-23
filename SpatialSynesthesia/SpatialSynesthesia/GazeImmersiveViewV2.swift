@@ -8,7 +8,8 @@
 //  (analytic ray–plane intersection in world space, then `worldToLocal`). No scene raycast / spatial gesture.
 //
 //  MVP behavior:
-//  - Full-canvas overlay is driven by `GazeInteractionManager` + authored region categories.
+//  - Passthrough color uses only preferredSurroundingsEffect (chapters + gaze focus).
+//  - GazeInteractionManager still owns focus/overlay state; no 3D tint plane on the canvas.
 //  - Tap uses the same plane-local resolution (no per-region entities).
 //
 
@@ -16,18 +17,22 @@ import ARKit
 import RealityKit
 import RealityKitContent
 import SwiftUI
+import Foundation
 import UIKit
 import QuartzCore
 import simd
+
+/// Identity passthrough tint (neutral multiply) when Chapter 2 releases gaze tint.
+private let kNeutralSurroundingsMultiply = SurroundingsEffect.colorMultiply(Color(red: 1, green: 1, blue: 1))
 
 // MARK: - PaintingAndEasel loading (Phase 1: aligned interactive plane; Phase 2 prep: UV/submesh)
 
 // Temporary visual orientation debug for the 3D easel-aligned interactive plane.
 // Makes the aligned plane tint + adds explicit front/back markers.
-// Keep this enabled while diagnosing upside-down / backfacing issues.
+// Set to `true` in DEBUG when diagnosing upside-down / backfacing issues (adds visible marker geometry).
 private let alignedPlaneOrientationDebugVisible: Bool = {
     #if DEBUG
-    return true
+    return false
     #else
     return false
     #endif
@@ -66,11 +71,9 @@ private func findPaintingSurface(in entity: Entity) -> Entity {
 
 @MainActor
 final class PaintingSceneStateV2 {
-    var overlayEntity: Entity?
     var regions: [PaintingRegion] = []
     var regionByEntityName: [String: PaintingRegion] = [:]
-    var overlayEnabled: Bool = true
-    /// Strongly-held subscription so per-frame overlay updates keep running.
+    /// Strongly-held subscription so per-frame updates keep running.
     var sceneUpdateSubscription: EventSubscription?
 
     /// `Scene` from `SceneEvents.Update` (same frame as gaze logic). `Entity.scene` / `@Environment` are often nil here.
@@ -83,9 +86,6 @@ final class PaintingSceneStateV2 {
     var arSession: ARKitSession?
     var worldTracking: WorldTrackingProvider?
 
-    /// Head anchor: intro veil / world tint wash (not used for gaze ray).
-    var headAnchorEntity: AnchorEntity?
-
     // MARK: - Audio sync
     var lastAppliedAudioMixVersion: UInt64 = 0
 
@@ -97,29 +97,24 @@ final class PaintingSceneStateV2 {
     }
     var interactionSource: InteractionSource = .flatPaintingPlane
 
-    // MARK: - Scene-level passthrough/world tint (broad wash)
-    var worldTintWashEntity: ModelEntity?
-
     // MARK: - Region trust diagnostics
-    /// `PaintingCanvas` root from `PaintingCanvasEntity.build` (plane, regions, overlay).
+    /// `PaintingCanvas` root from `PaintingCanvasEntity.build` (plane + regions).
     var paintingCanvasRoot: Entity?
     var paintingPlaneEntity: Entity?
     var lastGazeNormalizedUV: (u: Float, v: Float)?
     var lastGazeHitEntityName: String?
 
-    // MARK: - Intro veil (brand title dissolving away)
-    var introOpacity: Float = 1
-    var introIsActive: Bool = true
-    var introFadeDuration: Float = 5.0
-    var introElapsedTime: Float = 0
-    var introLastTickTime: CFTimeInterval?
-    var introVeilRoot: Entity?
-    /// Inward-facing black sphere (spatial blackout); no collision/input.
-    var introShellEntity: ModelEntity?
-    var introTextEntity: ModelEntity?
-
-    /// Gates initial ensemble + mix until intro veil has fully faded (exactly once).
+    /// Ensemble + mix started after scene load (no intro veil).
     var hasStartedExperienceAudio: Bool = false
+
+    /// Throttles `[Reveal]` brightness logs in `applyRevealPassthrough` (once per integer second).
+    var lastRevealEffectLogSecond: Int = -1
+
+    // MARK: - Reveal sequence (ChapterController `.reveal` → Chapter 1 handoff)
+    /// Previous `ChapterController.Chapter` for edge detection (reveal → chapterOne fade).
+    var trackedChapterForRevealTransition: ChapterController.Chapter = .blackout
+    /// Elapsed seconds of brightening passthrough after reveal completes (first segment of Chapter 1).
+    var revealToChapterOneFadeElapsed: Float = 0
 
     /// Throttles `[ColorGrade]` logging (update loop runs every frame).
     var lastColorGradePrintTime: CFTimeInterval = 0
@@ -151,7 +146,7 @@ final class PaintingSceneStateV2 {
     var debugLastHeartbeatTime: CFTimeInterval?
     /// Dedupe `[LookTarget]` when region id under pointer changes.
     var debugLastLookTargetLogId: String?
-    /// One-shot `[PaintingPlaneReady]` after intro.
+    /// One-shot `[PaintingPlaneReady]` once the plane is live.
     var debugLoggedPaintingPlaneReadiness: Bool = false
     #endif
 }
@@ -167,18 +162,22 @@ struct GazeImmersiveViewV2: View {
     /// Fast fade to neutral when gaze leaves a focused region (Chapter 2 only).
     private let ch2ReleaseDuration: Float = 0.35
 
+    /// Brighten passthrough from reveal darkness to neutral after reveal completes.
+    private let revealToChapterOneFadeDuration: Float = 1.2
+
+    /// Near-black floor during reveal; color pulses add on top.
+    private let revealPassthroughBaseDarkness: Float = 0.04
+
+    /// Additional grayscale lift from silhouette end → end of reveal (faint silhouette between bursts).
+    private let revealPassthroughPostSilhouetteLift: Float = 0.06
+
     // Primary, supported passthrough tint via SurroundingsEffect.
-    @State private var preferredSurroundingsEffectValue: SurroundingsEffect? = nil
+    @State private var preferredSurroundingsEffectValue: SurroundingsEffect = .colorMultiply(Color(red: 0, green: 0, blue: 0))
 
     var body: some View {
         RealityView { content in
             await setupScene(content: content)
         }
-        .overlay(
-            Color.black.opacity(chapterController.fadeOpacity)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-        )
         .gesture(
             SpatialTapGesture()
                 .targetedToAnyEntity()
@@ -188,12 +187,19 @@ struct GazeImmersiveViewV2: View {
         )
         .preferredSurroundingsEffect(preferredSurroundingsEffectValue)
         .onAppear {
+            preferredSurroundingsEffectValue = .colorMultiply(Color(red: 0, green: 0, blue: 0))
             orchestrator = SynesthesiaOrchestrator(audioManager: AudioManager.shared)
             orchestrator?.isActive = true
-            chapterController.begin()
+            orchestrator?.regionHighlightDisplayMode = .off
+            chapterController.onRevealBegan = {
+                orchestrator?.resetForReveal()
+            }
             #if DEBUG
-            AuthoredPaintingRegion.kandinskyComposition.forEach { r in
-                print("[RegionMap] \(r.id) category=\(r.category) hex=\(r.hexColor)")
+            Task { @MainActor in
+                Chapter1Score.logRevealSetupAndVerifyRegionIds()
+                AuthoredPaintingRegion.kandinskyComposition.forEach { r in
+                    print("[RegionMap] \(r.id) category=\(r.category) hex=\(r.hexColor)")
+                }
             }
             Task {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -221,32 +227,9 @@ struct GazeImmersiveViewV2: View {
         let root = AnchorEntity(.world(transform: matrix_identity_float4x4))
         content.add(root)
 
-        // Broad primary visual cue: a surrounding world-tint wash driven by focus state.
-        // Limitation: this tints the immersive view via a camera-anchored proxy entity
-        // (supported RealityKit), not a system-level passthrough tint.
-        // Use a head-anchored proxy so the wash stays stable while the user moves gaze.
-        let headAnchor = AnchorEntity(.head)
-        content.add(headAnchor)
-        sceneState.headAnchorEntity = headAnchor
-        let wash = makeWorldTintWashEntity()
-        headAnchor.addChild(wash)
-        sceneState.worldTintWashEntity = wash
-
-        // Intro: spatial black shell (inverted sphere) + 3D title; fades to reveal the scene.
-        // No collision shapes and no InputTarget/hover — does not affect painting raycasts.
-        sceneState.introOpacity = 1
-        sceneState.introIsActive = true
-        sceneState.introFadeDuration = 5.0
-        sceneState.introElapsedTime = 0
-        sceneState.introLastTickTime = nil
+        // REMOVING: head-anchor intro shell + title — darkness is only via preferredSurroundingsEffect.
         sceneState.hasStartedExperienceAudio = false
-        // Block ensemble + preload + setAudioMix until intro shell completes (defense in depth vs. stray calls).
         AudioManager.shared.isIntroAudioGated = true
-        let introVeil = makeIntroVeilEntities(introOpacityStart: 1)
-        sceneState.introVeilRoot = introVeil.root
-        sceneState.introShellEntity = introVeil.shell
-        sceneState.introTextEntity = introVeil.text
-        headAnchor.addChild(introVeil.root)
 
         // Phase 1: Try to load 3D PaintingAndEasel and align interactive plane to its painting surface.
         // Fallback: standalone flat canvas (current behavior).
@@ -340,10 +323,8 @@ struct GazeImmersiveViewV2: View {
             #endif
         }
 
-        sceneState.overlayEntity = result.overlayEntity
         sceneState.regions = result.regions
         sceneState.regionByEntityName = result.regionByEntityName
-        sceneState.overlayEnabled = !appModel.isOverlayDebugDisabled
 
         // Keep a reference to the painting plane for gaze hit-point -> UV mapping.
         sceneState.paintingCanvasRoot = result.root
@@ -373,12 +354,25 @@ struct GazeImmersiveViewV2: View {
         }
         #endif
 
-        // Hide interactive canvas until intro shell completes (no change to immersion style / startup order).
-        result.root.isEnabled = false
+        // Canvas is in scene immediately; visibility is from colorMultiply black until chapters advance.
+        result.root.isEnabled = true
 
-        // Ensemble + mix start is deferred until intro veil completes (see SceneEvents.Update).
+        AudioManager.shared.isIntroAudioGated = false
+        sceneState.hasStartedExperienceAudio = true
+        AudioManager.shared.setAudioMix(
+            focusState: gazeManager.focusState,
+            category: gazeManager.responseCategory
+        )
+        sceneState.lastAppliedAudioMixVersion = gazeManager.audioMixVersion
 
-        // Drive fade + overlay updates from RealityKit's per-frame SceneEvents.Update
+        print("[Init] scene entities loaded — calling begin()")
+        chapterController.begin()
+
+        #if DEBUG
+        logSceneInventory(content: content)
+        #endif
+
+        // Drive passthrough + interaction from RealityKit's per-frame SceneEvents.Update
         // rather than RealityView's SwiftUI-driven `update:` callback.
         sceneState.sceneUpdateSubscription?.cancel()
         sceneState.sceneUpdateSubscription = content.subscribe(to: SceneEvents.Update.self) { event in
@@ -386,12 +380,42 @@ struct GazeImmersiveViewV2: View {
                 sceneState.sceneFromUpdateLoop = event.scene
 
                 let deltaTime = Float(event.deltaTime)
-                chapterController.tick(deltaTime: TimeInterval(deltaTime))
+
+                let prevTrackedChapter = sceneState.trackedChapterForRevealTransition
+                defer { sceneState.trackedChapterForRevealTransition = chapterController.currentChapter }
+
+                chapterController.tick(deltaTime: deltaTime)
+                applyCurrentPassthroughEffect(deltaTime: deltaTime)
+
                 if chapterController.currentChapter == .transitioning {
                     chapterController.updateTransitionBlend(deltaTime: deltaTime)
                 }
 
-                if chapterController.isChapterOneActive {
+                if prevTrackedChapter == .reveal,
+                   chapterController.currentChapter == .chapterOne {
+                    sceneState.revealToChapterOneFadeElapsed = 0
+                    print("[Reveal] transitioning to Chapter 1 brightness")
+                }
+
+                if chapterController.isRevealActive {
+                    if let plane = sceneState.paintingPlaneEntity {
+                        orchestrator?.setupHighlightEntities(
+                            regions: AuthoredPaintingRegion.kandinskyComposition,
+                            paintingEntity: plane
+                        )
+                    }
+                }
+
+                if chapterController.currentChapter == .chapterOne,
+                   sceneState.revealToChapterOneFadeElapsed < revealToChapterOneFadeDuration {
+                    sceneState.revealToChapterOneFadeElapsed += deltaTime
+                    let linear = Double(min(1.0, sceneState.revealToChapterOneFadeElapsed / revealToChapterOneFadeDuration))
+                    let tEase = 1.0 - pow(1.0 - linear, 3.0)
+                    let brightness = 0.10 + (1.0 - 0.10) * tEase
+                    assignPreferredSurroundingsEffect(
+                        .colorMultiply(Color(red: brightness, green: brightness, blue: brightness))
+                    )
+                } else if chapterController.isChapterOneActive {
                     if let plane = sceneState.paintingPlaneEntity {
                         orchestrator?.setupHighlightEntities(
                             regions: AuthoredPaintingRegion.kandinskyComposition,
@@ -411,22 +435,9 @@ struct GazeImmersiveViewV2: View {
                     )
                 }
 
-                // 0) Fade the intro veil independently from gaze/audio/region logic.
-                let introJustCompleted = tickIntroVeil()
-
                 #if DEBUG
                 logPaintingPlaneReadinessOnce()
                 #endif
-
-                if introJustCompleted {
-                    AudioManager.shared.isIntroAudioGated = false
-                    sceneState.hasStartedExperienceAudio = true
-                    AudioManager.shared.setAudioMix(
-                        focusState: gazeManager.focusState,
-                        category: gazeManager.responseCategory
-                    )
-                    sceneState.lastAppliedAudioMixVersion = gazeManager.audioMixVersion
-                }
 
                 chapterController.tickSignifier(deltaTime: deltaTime)
                 if let signifierColor = chapterController.signifierEffect {
@@ -452,7 +463,7 @@ struct GazeImmersiveViewV2: View {
                     sceneState.debugLastHeartbeatTime = hbNow
                     let focusShort = gazeFocusStateShortLabel(gazeManager.focusState)
                     spatialSynesthesiaDebugLog(
-                        "[Heartbeat] appAlive=true introActive=\(sceneState.introIsActive) focusState=\(focusShort) " +
+                        "[Heartbeat] appAlive=true introActive=false focusState=\(focusShort) " +
                         "localSource=\(sceneState.debugLastGazeLocalSource) hitEntity=\(sceneState.lastGazeHitEntityName ?? "nil") " +
                         "candidateRegion=\(sceneState.debugLastGazeCandidateRegionId ?? "nil")"
                     )
@@ -471,19 +482,18 @@ struct GazeImmersiveViewV2: View {
 
                 // 2) Smooth overlay fade (overlay application is gated separately).
                 gazeManager.tickOverlayFade()
-                applyOverlayNow()
 
                 // 2b) Broad world tint wash driven by the same focus state machine.
                 updateWorldTintFromFocusState(deltaTime: deltaTime)
 
                 // 3) Audio mix: apply every frame after intro so `.focused` / `.preFocus` stays in sync even when
                 //    `audioMixVersion` does not change (e.g. relaunch already focused). No category filtering.
-                if sceneState.hasStartedExperienceAudio, !sceneState.introIsActive {
+                if sceneState.hasStartedExperienceAudio {
                     let versionChanged = gazeManager.audioMixVersion != sceneState.lastAppliedAudioMixVersion
                     if versionChanged {
                         #if DEBUG
                         spatialSynesthesiaDebugLogAudioGateContext(
-                            introJustCompleted: introJustCompleted,
+                            introJustCompleted: false,
                             willCallSetAudioMix: true
                         )
                         if appModel.isDebugMode {
@@ -547,32 +557,6 @@ struct GazeImmersiveViewV2: View {
                         )
                     }
                     #endif
-                } else if introJustCompleted {
-                    // First audio start: after intro is gone, once — then existing mix behavior applies.
-                    // `setAudioMix` calls `startEnsembleLoop()` internally — do not call twice (avoids duplicate preload).
-                    #if DEBUG
-                    spatialSynesthesiaDebugLogAudioGateContext(
-                        introJustCompleted: true,
-                        willCallSetAudioMix: true
-                    )
-                    #endif
-                    AudioManager.shared.isIntroAudioGated = false
-                    sceneState.hasStartedExperienceAudio = true
-                    #if DEBUG
-                    logInteractionAudioDebugChain()
-                    // Match main `setAudioMix` branch: gaze-driven first mix after intro should emit `[Perception]` too.
-                    if gazeManager.debugLastAudioMixBumpSource == .gaze {
-                        logGazeConfirmedEyeTrackSoundPerceptionIfChanged(
-                            sceneState: sceneState,
-                            gazeManager: gazeManager
-                        )
-                    }
-                    #endif
-                    AudioManager.shared.setAudioMix(
-                        focusState: gazeManager.focusState,
-                        category: gazeManager.responseCategory
-                    )
-                    sceneState.lastAppliedAudioMixVersion = gazeManager.audioMixVersion
                 }
             }
         }
@@ -606,32 +590,23 @@ struct GazeImmersiveViewV2: View {
             } else {
                 print("[GazeImmersiveViewV2] WARNING: Could not find PaintingPlane entity under canvas root.")
             }
-
-            if let overlayModel = result.overlayEntity as? ModelEntity {
-                let overlayOpacityStart = overlayModel.components[OpacityComponent.self]?.opacity ?? -1
-                print(
-                    "[GazeImmersiveViewV2] Verified Overlay entity: name=\(overlayModel.name), localPosition=\(overlayModel.position), opacityComponentStart=\(String(format: "%.3f", overlayOpacityStart))"
-                )
-            } else {
-                print("[GazeImmersiveViewV2] WARNING: overlayEntity was not a ModelEntity.")
-            }
         }
-
-        // Ensure overlay starts invisible even if a previous category sneaked in.
-        if let overlayModel = sceneState.overlayEntity as? ModelEntity {
-            ColorFilterOverlay.updateOverlay(overlayModel, category: nil, opacity: 0)
-        }
-
-        if appModel.isOverlayDebugDisabled {
-            print("[GazeImmersiveViewV2] Overlay debug disabled: overlay will not be updated; texture should be visible underneath.")
-        }
-
         if appModel.isDebugMode {
             print("[GazeImmersiveViewV2] Canvas ready; \(result.regions.count) regions")
         }
     }
 
     #if DEBUG
+    /// One-shot root-entity inventory after immersive scene setup (DEBUG).
+    private func logSceneInventory(content: RealityViewContent) {
+        var count = 0
+        for entity in content.entities {
+            print("[SceneInventory] \(entity.name) children=\(entity.children.count)")
+            count += 1
+        }
+        print("[SceneInventory] total root entities=\(count)")
+    }
+
     private func spatialSynesthesiaDebugLog(_ message: String) {
         print("[SpatialSynesthesia] \(message)")
     }
@@ -646,8 +621,8 @@ struct GazeImmersiveViewV2: View {
             }
         }()
         spatialSynesthesiaDebugLog(
-            "[AudioGate] hasStarted=\(sceneState.hasStartedExperienceAudio) introActive=\(sceneState.introIsActive) " +
-            "introElapsed=\(String(format: "%.2f", sceneState.introElapsedTime)) introJustCompleted=\(introJustCompleted) " +
+            "[AudioGate] hasStarted=\(sceneState.hasStartedExperienceAudio) introActive=false " +
+            "introElapsed=n/a introJustCompleted=\(introJustCompleted) " +
             "introGate=\(AudioManager.shared.isIntroAudioGated) focus=\(focusStr) willCallSetAudioMix=\(willCallSetAudioMix)"
         )
     }
@@ -769,10 +744,9 @@ struct GazeImmersiveViewV2: View {
         }
     }
 
-    /// After intro, once: confirms `PaintingPlane` interaction components (`appModel.isDebugMode`).
+    /// Once the plane is live: confirms `PaintingPlane` interaction components (`appModel.isDebugMode`).
     private func logPaintingPlaneReadinessOnce() {
         guard appModel.isDebugMode else { return }
-        guard !sceneState.introIsActive else { return }
         guard !sceneState.debugLoggedPaintingPlaneReadiness, let plane = sceneState.paintingPlaneEntity else { return }
         sceneState.debugLoggedPaintingPlaneReadiness = true
         let hasInput = plane.components[InputTargetComponent.self] != nil
@@ -787,142 +761,7 @@ struct GazeImmersiveViewV2: View {
 
     #endif
 
-    /// Applies the overlay tint immediately based on the current fade state.
-    private func applyOverlayNow() {
-        guard sceneState.overlayEnabled else { return }
-        guard let overlayModel = sceneState.overlayEntity as? ModelEntity else { return }
-
-        let cat = gazeManager.overlayCategoryForRendering
-        let opacity = gazeManager.overlayOpacityForMaterial
-
-        if let cat, opacity > 0.001,
-           let region = gazeManager.activeRegion,
-           !region.hexColor.isEmpty,
-           let base = UIColor(hex: region.hexColor) {
-            let a = CGFloat(opacity) * cat.overlayAlpha
-            ColorFilterOverlay.updateOverlay(overlayModel, color: base.withAlphaComponent(a))
-            return
-        }
-
-        ColorFilterOverlay.updateOverlay(
-            overlayModel,
-            category: cat,
-            opacity: opacity
-        )
-    }
-
-    // MARK: - Intro veil (spatial black shell)
-
-    private func makeIntroVeilEntities(introOpacityStart: Float) -> (root: Entity, shell: ModelEntity, text: ModelEntity) {
-        // Head-anchored root: viewer sits inside the shell (environmental blackout, not a flat card).
-        let root = Entity()
-        root.name = "IntroVeilRoot"
-        root.position = SIMD3<Float>(0, 0, 0)
-
-        // Large inward-facing sphere: negate X so interior faces render (same pattern as WorldTintWash).
-        let shellRadius: Float = 18.0
-        let shellMesh = MeshResource.generateSphere(radius: shellRadius)
-        let shellMaterial = UnlitMaterial(color: .black)
-        let shell = ModelEntity(mesh: shellMesh, materials: [shellMaterial])
-        shell.name = "IntroBlackShell"
-        shell.scale = SIMD3<Float>(-1, 1, 1)
-        shell.components.set(OpacityComponent(opacity: introOpacityStart))
-        // Intentionally no generateCollisionShapes / InputTarget / HoverEffect.
-        root.addChild(shell)
-
-        // Option A: 3D title inside the shell; fades with the shell (no cutout shader).
-        let font = UIFont.systemFont(ofSize: 0.14, weight: .bold)
-        let textMesh = MeshResource.generateText(
-            "synesthesia",
-            extrusionDepth: 0.01,
-            font: font
-        )
-        let textMaterial = SimpleMaterial(color: .white, isMetallic: false)
-        let text = ModelEntity(mesh: textMesh, materials: [textMaterial])
-        text.name = "IntroVeilText"
-        text.components.set(OpacityComponent(opacity: introOpacityStart))
-        root.addChild(text)
-
-        // Center title in front of the viewer (head space: -Z forward).
-        let bounds = text.visualBounds(relativeTo: root)
-        let center = SIMD3<Float>(
-            (bounds.min.x + bounds.max.x) * 0.5,
-            (bounds.min.y + bounds.max.y) * 0.5,
-            (bounds.min.z + bounds.max.z) * 0.5
-        )
-        let titleZ: Float = -2.6
-        text.position = SIMD3<Float>(-center.x, -center.y, titleZ - center.z)
-
-        return (root, shell, text)
-    }
-
-    /// - Returns: `true` when the intro veil finished this frame (fade complete or failed-safe removal).
-    private func tickIntroVeil() -> Bool {
-        guard sceneState.introIsActive else { return false }
-        guard
-            let shell = sceneState.introShellEntity,
-            let text = sceneState.introTextEntity
-        else {
-            // If something went missing, disable the veil to avoid blocking the experience.
-            sceneState.introIsActive = false
-            sceneState.paintingCanvasRoot?.isEnabled = true
-            #if DEBUG
-            print("[SpatialSynesthesia] [CanvasEnabled] introFinished=true canvasEnabled=true")
-            #endif
-            sceneState.introVeilRoot?.removeFromParent()
-            sceneState.introVeilRoot = nil
-            sceneState.introShellEntity = nil
-            sceneState.introTextEntity = nil
-            return true
-        }
-
-        let now = CACurrentMediaTime()
-        if let last = sceneState.introLastTickTime {
-            sceneState.introElapsedTime += Float(max(0, now - last))
-        } else {
-            // First tick: start at current time without skipping duration.
-            sceneState.introElapsedTime = 0
-        }
-        sceneState.introLastTickTime = now
-
-        let denom = max(sceneState.introFadeDuration, 0.0001)
-        let progress = min(1, sceneState.introElapsedTime / denom)
-        let nextOpacity = max(0, 1 - progress)
-        sceneState.introOpacity = nextOpacity
-
-        shell.components.set(OpacityComponent(opacity: nextOpacity))
-        text.components.set(OpacityComponent(opacity: nextOpacity))
-
-        if progress >= 1 {
-            sceneState.introIsActive = false
-            sceneState.paintingCanvasRoot?.isEnabled = true
-            #if DEBUG
-            print("[SpatialSynesthesia] [CanvasEnabled] introFinished=true canvasEnabled=true")
-            #endif
-            sceneState.introVeilRoot?.removeFromParent()
-            sceneState.introVeilRoot = nil
-            sceneState.introShellEntity = nil
-            sceneState.introTextEntity = nil
-            return true
-        }
-        return false
-    }
-
     // MARK: - Passthrough color grade (SurroundingsEffect — single entry point)
-
-    private func makeWorldTintWashEntity() -> ModelEntity {
-        // Large sphere around the camera so the whole immersive view appears tinted.
-        // We invert the sphere by scaling to [-1, 1, 1] so inside faces render.
-        let radius: Float = 20.0
-        let mesh = MeshResource.generateSphere(radius: radius)
-        let initialMaterial = UnlitMaterial(color: UIColor.white.withAlphaComponent(0))
-        let entity = ModelEntity(mesh: mesh, materials: [initialMaterial])
-        entity.name = "WorldTintWash"
-        entity.scale = SIMD3<Float>(-1, 1, 1)
-        entity.components.set(OpacityComponent(opacity: 0))
-        // No collisions: must not affect taps/region hit testing.
-        return entity
-    }
 
     #if DEBUG
     private func diagnoseColorGrade() {
@@ -955,12 +794,64 @@ struct GazeImmersiveViewV2: View {
         return (boostedR, boostedG, boostedB)
     }
 
+    /// Every frame: drive `preferredSurroundingsEffect` for blackout / fade-in / reveal (visionOS may reset between frames).
+    private func applyCurrentPassthroughEffect(deltaTime: Float) {
+        switch chapterController.currentChapter {
+        case .blackout:
+            assignPreferredSurroundingsEffect(.colorMultiply(Color(red: 0, green: 0, blue: 0)))
+        case .fadingIn:
+            let b = Double(chapterController.fadingInPassthroughBrightness)
+            assignPreferredSurroundingsEffect(.colorMultiply(Color(red: b, green: b, blue: b)))
+        case .reveal:
+            applyRevealPassthrough(
+                revealPhase: chapterController.revealPhase,
+                regionRevealPhase: chapterController.regionRevealPhase,
+                deltaTime: deltaTime
+            )
+        default:
+            break
+        }
+    }
+
     /// Diagnostic: log every write to `preferredSurroundingsEffect` (via `preferredSurroundingsEffectValue`).
-    private func assignPreferredSurroundingsEffect(_ newValue: SurroundingsEffect?, file: StaticString = #file, line: UInt = #line) {
+    private func assignPreferredSurroundingsEffect(_ newValue: SurroundingsEffect, file: StaticString = #file, line: UInt = #line) {
         #if DEBUG
         print("[EffectSet] \(file):\(line) value=\(String(describing: newValue))")
         #endif
         preferredSurroundingsEffectValue = newValue
+    }
+
+    private func applyRevealPassthrough(
+        revealPhase: Float,
+        regionRevealPhase: Float,
+        deltaTime: Float
+    ) {
+        orchestrator?.updateReveal(regionRevealPhase: regionRevealPhase, deltaTime: deltaTime)
+        let pulse = orchestrator?.revealWorldPulse(regionRevealPhase: regionRevealPhase) ?? (0, 0, 0)
+        let pr = pulse.0
+        let pg = pulse.1
+        let pb = pulse.2
+
+        let silhouetteEnd = Float(chapterController.silhouetteDuration / chapterController.revealDuration)
+        let postSilhouetteProgress = max(0, (revealPhase - silhouetteEnd) / (1.0 - silhouetteEnd))
+        let base = revealPassthroughBaseDarkness + postSilhouetteProgress * revealPassthroughPostSilhouetteLift
+
+        let finalR = min(1.0, Double(base + pr))
+        let finalG = min(1.0, Double(base + pg))
+        let finalB = min(1.0, Double(base + pb))
+        assignPreferredSurroundingsEffect(
+            .colorMultiply(Color(red: finalR, green: finalG, blue: finalB))
+        )
+        let s = Int(chapterController.revealElapsed)
+        if s != sceneState.lastRevealEffectLogSecond {
+            sceneState.lastRevealEffectLogSecond = s
+            let pulseMax = max(pr, pg, pb)
+            let brightness = base + pulseMax
+            print(
+                "[Reveal] t=\(s)s base=\(String(format: "%.3f", base)) " +
+                "pulse=\(String(format: "%.3f", pulseMax)) brightness=\(String(format: "%.3f", brightness))"
+            )
+        }
     }
 
     /// Chapter 1: neutral-lerp `colorMultiply` from score-mixed vivid RGB (`SynesthesiaOrchestrator.additiveColorMix`).
@@ -971,7 +862,7 @@ struct GazeImmersiveViewV2: View {
         energy: Float,
         dominantFallback: KandinskyColorCategory?
     ) {
-        let minimumChapter1Strength: Float = 0.25
+        let minimumChapter1Strength: Float = 0.40
         let effectiveStrength = max(minimumChapter1Strength, min(1.0, energy * 1.2))
 
         let vivid = boostToVivid(r: r, g: g, b: b)
@@ -1036,7 +927,7 @@ struct GazeImmersiveViewV2: View {
         ch2LogGradeDiagnostics: Bool = false
     ) {
         guard intensity > 0.01 else {
-            assignPreferredSurroundingsEffect(nil)
+            assignPreferredSurroundingsEffect(kNeutralSurroundingsMultiply)
             return
         }
 
@@ -1087,7 +978,7 @@ struct GazeImmersiveViewV2: View {
     /// Chapter 2: passthrough grade from the region's authored painting hex (boosted), not category→vivid alone.
     private func applyChapter2GradeFromRegion(_ region: PaintingRegion, intensity: Float) {
         guard intensity > 0.01 else {
-            assignPreferredSurroundingsEffect(nil)
+            assignPreferredSurroundingsEffect(kNeutralSurroundingsMultiply)
             return
         }
 
@@ -1180,10 +1071,6 @@ struct GazeImmersiveViewV2: View {
     }
 
     private func updateWorldTintFromFocusState(deltaTime: Float) {
-        guard let wash = sceneState.worldTintWashEntity else { return }
-
-        ColorFilterOverlay.updateOverlay(wash, color: .clear)
-
         let fs = gazeManager.focusState
         let prev = sceneState.ch2PreviousFocusState
 
@@ -1231,7 +1118,7 @@ struct GazeImmersiveViewV2: View {
             if remainingIntensity > 0.01 {
                 applyChapter2GradeFromRegion(releasingRegion, intensity: remainingIntensity)
             } else {
-                assignPreferredSurroundingsEffect(nil)
+                assignPreferredSurroundingsEffect(kNeutralSurroundingsMultiply)
                 sceneState.ch2ReleasingFromRegion = nil
                 sceneState.ch2ReleaseTimer = 0
                 print("[Ch2-Stage] RELEASED fade complete")
@@ -1262,14 +1149,14 @@ struct GazeImmersiveViewV2: View {
 
         switch fs {
         case .noFocus, .released:
-            assignPreferredSurroundingsEffect(nil)
+            assignPreferredSurroundingsEffect(kNeutralSurroundingsMultiply)
             ch2LogStageLineIfChanged("NEUTRAL:\(ch2FocusStateLogKey(fs))") {
                 print("[Ch2-Stage] NEUTRAL")
             }
         case .preFocus(let region):
-            applyChapter2GradeFromRegion(region, intensity: 0.35)
+            applyChapter2GradeFromRegion(region, intensity: 0.40)
             ch2LogStageLineIfChanged("PREFOCUS:\(region.id)") {
-                print("[Ch2-Stage] PREFOCUS category=\(region.colorCategory) strength=0.35")
+                print("[Ch2-Stage] PREFOCUS category=\(region.colorCategory) strength=0.40")
             }
         case .focused(let region):
             applyChapter2GradeFromRegion(region, intensity: 1.0)
@@ -1318,7 +1205,6 @@ struct GazeImmersiveViewV2: View {
 
             // Start fade/update immediately so the UI responds on this tap.
             gazeManager.tickOverlayFade()
-            applyOverlayNow()
 
             #if DEBUG
             if appModel.isDebugMode {
@@ -1336,7 +1222,7 @@ struct GazeImmersiveViewV2: View {
             }
             #endif
 
-            if sceneState.hasStartedExperienceAudio, !sceneState.introIsActive {
+            if sceneState.hasStartedExperienceAudio {
                 if gazeManager.audioMixVersion != sceneState.lastAppliedAudioMixVersion {
                     sceneState.lastAppliedAudioMixVersion = gazeManager.audioMixVersion
                     #if DEBUG
@@ -1497,14 +1383,14 @@ struct GazeImmersiveViewV2: View {
     }
 
     private func currentGazeCandidateRegion() -> PaintingRegion? {
-        let canvasReady = sceneState.paintingCanvasRoot?.isEnabled == true && !sceneState.introIsActive
+        let canvasReady = sceneState.paintingCanvasRoot?.isEnabled == true
         guard canvasReady else {
             sceneState.currentLookTargetRegionId = nil
             sceneState.lastGazeHitEntityName = nil
             #if DEBUG
             sceneState.debugLastGazeLocalSource = "none"
             logLookTargetIfChanged(regionId: nil)
-            logRaycastRawHitIfChanged(dedupeKey: "canvas_disabled_or_intro", hitEntityName: nil, distance: nil, hitPoint: nil)
+            logRaycastRawHitIfChanged(dedupeKey: "canvas_disabled", hitEntityName: nil, distance: nil, hitPoint: nil)
             #endif
             return nil
         }

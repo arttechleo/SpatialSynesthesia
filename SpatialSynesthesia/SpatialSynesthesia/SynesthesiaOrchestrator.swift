@@ -29,6 +29,13 @@ final class SynesthesiaOrchestrator {
     let maxSaturationBoost: Float = 0.18
     let maxTemperatureShift: Float = 0.06
 
+    /// Max per-channel contribution to passthrough `colorMultiply` during reveal flashes (no highlight geometry).
+    let maxRevealWorldPulse: Float = 0.35
+
+    /// Normalized phase within each reveal entry window — organic burst curve breakpoints.
+    private let burstRiseEnd: Float = 0.15
+    private let burstBloomEnd: Float = 0.35
+
     var isActive: Bool = false
     var chapterBlend: Float = 1.0
 
@@ -45,9 +52,7 @@ final class SynesthesiaOrchestrator {
     private let analyzer = StemAmplitudeAnalyzer()
     private let sequencer = BeatColorSequencer()
 
-    private var highlightEntities: [String: RegionHighlightEntity] = [:]
     private var didSetupHighlights = false
-    private var didLogRegionIds = false
 
     /// Dedupes `[Ch1-Pipeline]` logs on even integer seconds of elapsed time.
     private var lastScoreLogSecond: Int = -1
@@ -57,6 +62,10 @@ final class SynesthesiaOrchestrator {
 
     /// Throttles `[Ch1-Diagnostic]` logs to every 3 seconds.
     private var diagnosticTimer: Float = 0
+
+    /// Reveal-sequence highlight intensities keyed by `regionId`.
+    private var regionRevealIntensities: [String: Float] = [:]
+    private var regionRevealComplete: Set<String> = []
 
     init(audioManager: AudioManager) {
         self.audioManager = audioManager
@@ -82,43 +91,11 @@ final class SynesthesiaOrchestrator {
     func setupHighlightEntities(regions: [AuthoredPaintingRegion], paintingEntity: Entity) {
         guard !didSetupHighlights else { return }
         didSetupHighlights = true
-
-        guard regionHighlightDisplayMode != .off else {
-            #if DEBUG
-            print("[Ch1-Highlights] region highlight meshes disabled (clean painting surface)")
-            #endif
-            return
-        }
-
-        if !didLogRegionIds {
-            didLogRegionIds = true
-            #if DEBUG
-            AuthoredPaintingRegion.kandinskyComposition.forEach {
-                print("[RegionId] \($0.id) category=\($0.category)")
-            }
-            #endif
-        }
-
-        let primaryIds = Set(
-            KandinskyColorCategory.allCases.compactMap { Chapter1Score.primaryAuthoredRegionId(for: $0) }
-        )
-
-        for region in regions {
-            guard region.id != "authored_background",
-                  region.id != "authored_background_fallback" else { continue }
-
-            if regionHighlightDisplayMode == .followDominantCategory {
-                guard primaryIds.contains(region.id) else { continue }
-            }
-
-            let highlight = RegionHighlightEntity(region: region, paintingEntity: paintingEntity)
-            highlightEntities[region.id] = highlight
-        }
-        #if DEBUG
-        print(
-            "[Ch1-Highlights] mode=\(regionHighlightDisplayMode) created \(highlightEntities.count) region highlights"
-        )
-        #endif
+        // DISABLED — highlight boxes caused visible solid geometry blocking passthrough.
+        // Region highlighting is handled exclusively by `preferredSurroundingsEffect` color cycling.
+        print("[Highlights] geometry disabled — using surroundings effect only")
+        _ = regions
+        _ = paintingEntity
     }
 
     /// Weighted mix of `vividTintColor` channels from score-driven intensities (threshold 0.001).
@@ -213,7 +190,7 @@ final class SynesthesiaOrchestrator {
             seqRGB.r,
             seqRGB.g,
             seqRGB.b,
-            max(mixed.totalEnergy, 0.25),
+            max(mixed.totalEnergy, 0.40),
             analyzer.dominantCategory
         )
     }
@@ -237,53 +214,79 @@ final class SynesthesiaOrchestrator {
         deltaTime: Float,
         displayMode: RegionHighlightDisplayMode
     ) {
-        let dominant = intensities
-            .filter { $0.value > 0.05 }
-            .max(by: { lhs, rhs in
-                if lhs.value != rhs.value { return lhs.value < rhs.value }
-                return lhs.key.rawValue < rhs.key.rawValue
-            })
+        // DISABLED — no `RegionHighlightEntity` instances in scene; passthrough-only feedback.
+        _ = intensities
+        _ = deltaTime
+        _ = displayMode
+    }
 
-        let dominantPrimaryId: String? = {
-            guard let cat = dominant?.key else { return nil }
-            return Chapter1Score.primaryAuthoredRegionId(for: cat)
-        }()
+    func resetForReveal() {
+        regionRevealIntensities = [:]
+        regionRevealComplete = []
+        print("[Reveal] reveal score tracking reset (no highlight geometry)")
+    }
 
-        for (_, highlight) in highlightEntities {
-            var base = baseHighlightTarget(
-                region: highlight.region,
-                intensities: intensities
-            )
-            if displayMode == .followDominantCategory {
-                if let pid = dominantPrimaryId {
-                    base = highlight.region.id == pid ? base : 0
-                } else {
-                    base = 0
-                }
-            }
-            highlight.updateWithBreathing(
-                baseIntensity: base,
-                deltaTime: deltaTime,
-                breathStrength: 0.20
-            )
+    func updateReveal(regionRevealPhase: Float, deltaTime: Float) {
+        _ = deltaTime
+        updateRevealScoreTracking(regionRevealPhase: regionRevealPhase)
+    }
+
+    /// Normalized time `t` in [0, 1] for one entry's window → asymmetric burst (rise / bloom / decay).
+    private func organicBurstIntensity(normalizedT t: Float) -> Float {
+        if t < burstRiseEnd {
+            let p = t / burstRiseEnd
+            return p * p * p
+        } else if t < burstBloomEnd {
+            let p = (t - burstRiseEnd) / (burstBloomEnd - burstRiseEnd)
+            return 1.0 - p * 0.15 + sin(p * .pi) * 0.05
+        } else {
+            let denom = max(0.001, 1.0 - burstBloomEnd)
+            let p = (t - burstBloomEnd) / denom
+            return (1.0 - p) * (1.0 - p) * 0.85
         }
     }
 
-    /// Primary regions get full score; secondary same-category regions get a softer share.
-    private func baseHighlightTarget(
-        region: AuthoredPaintingRegion,
-        intensities: [KandinskyColorCategory: Float]
-    ) -> Float {
-        let base = intensities[region.category] ?? 0
-        guard base > 0.001 else { return 0 }
+    /// `t` in [0, 1] for this entry's slice until the next `revealAt`, or `nil` if not started.
+    private func normalizedRevealWindowT(regionRevealPhase: Float, entry: RegionRevealEntry) -> Float? {
+        guard regionRevealPhase >= entry.revealAt else { return nil }
+        let nextRevealAt = Chapter1Score.regionRevealSequence.first(where: { $0.revealAt > entry.revealAt })?.revealAt ?? 1.0
+        let windowSize = max(0.001, nextRevealAt - entry.revealAt)
+        return min(1.0, (regionRevealPhase - entry.revealAt) / windowSize)
+    }
 
-        if let primaryId = Chapter1Score.primaryAuthoredRegionId(for: region.category) {
-            if region.id == primaryId {
-                return base
-            }
-            return base * 0.4
+    /// Score / bookkeeping for `revealWorldPulse` — does not touch any entities.
+    private func updateRevealScoreTracking(regionRevealPhase: Float) {
+        for entry in Chapter1Score.regionRevealSequence {
+            guard let t = normalizedRevealWindowT(regionRevealPhase: regionRevealPhase, entry: entry) else { continue }
+            let burstIntensity = organicBurstIntensity(normalizedT: t)
+            let intensity = burstIntensity * entry.peakIntensity
+            regionRevealIntensities[entry.regionId] = intensity
+            regionRevealComplete.insert(entry.regionId)
         }
-        return base * 0.5
+    }
+
+    /// Organic colored pulses on passthrough (whole-view multiply; shaped like light leaking from the painting).
+    func revealWorldPulse(regionRevealPhase: Float) -> (r: Float, g: Float, b: Float) {
+        var r: Float = 0, g: Float = 0, b: Float = 0
+
+        for entry in Chapter1Score.regionRevealSequence {
+            guard let t = normalizedRevealWindowT(regionRevealPhase: regionRevealPhase, entry: entry) else { continue }
+
+            let burstIntensity = organicBurstIntensity(normalizedT: t)
+            let scaled = burstIntensity * entry.peakIntensity
+
+            let color = entry.category.vividTintColor
+            var cr: CGFloat = 0, cg: CGFloat = 0, cb: CGFloat = 0, ca: CGFloat = 0
+            color.getRed(&cr, green: &cg, blue: &cb, alpha: &ca)
+
+            let contribution = scaled * maxRevealWorldPulse
+            r += Float(cr) * contribution
+            g += Float(cg) * contribution
+            b += Float(cb) * contribution
+        }
+
+        let cap = maxRevealWorldPulse
+        return (min(cap, r), min(cap, g), min(cap, b))
     }
 
 }

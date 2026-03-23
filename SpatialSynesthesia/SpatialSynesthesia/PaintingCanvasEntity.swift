@@ -1,7 +1,7 @@
 //
 //  PaintingCanvasEntity.swift
 //
-//  Builds the 3D painting canvas: textured plane (single collider) + full-canvas overlay.
+//  Builds the 3D painting canvas: textured plane (single collider). Passthrough tint is view-level only.
 //  Interaction regions are logical only (`AuthoredPaintingRegion`); resolve from plane local hit point.
 //
 
@@ -16,9 +16,6 @@ private let canvasHeight: Float = 0.9
 /// Distance in front of user (world Z).
 private let canvasDistance: Float = -1.35
 private let canvasHeightFromOrigin: Float = 0.2
-/// Full-canvas overlay Y offset (slightly in front to avoid z-fighting).
-private let overlayZOffset: Float = 0.009
-
 private func defaultRegions() -> [PaintingRegion] {
     AuthoredPaintingRegion.paintingRegions(canvasWidth: canvasWidth, canvasHeight: canvasHeight)
 }
@@ -27,7 +24,6 @@ private func defaultRegions() -> [PaintingRegion] {
 
 struct PaintingCanvasResult {
     let root: Entity
-    let overlayEntity: Entity
     let regions: [PaintingRegion]
     /// Map from region entity name (region.id) to PaintingRegion.
     var regionByEntityName: [String: PaintingRegion] {
@@ -104,32 +100,9 @@ enum PaintingCanvasEntity {
             }
         }
 
-        // 2. Full-canvas overlay (color updated by GazeInteractionManager)
-        // Put overlay slightly in front of the textured plane so it visually covers the painting.
-        let overlay = ColorFilterOverlay.makeOverlayEntity(
-            width: canvasWidth,
-            height: canvasHeight,
-            yOffset: overlayZOffset,
-            initialCategory: nil
-        )
-        root.addChild(overlay)
+        // REMOVING: ColorFilterOverlay plane — passthrough filters use `preferredSurroundingsEffect` only.
 
-        if debugMode {
-            let overlayMaterials = (overlay.components[ModelComponent.self]?.materials ?? [])
-            let overlayMatTypes = overlayMaterials
-                .map { String(describing: type(of: $0)) }
-                .joined(separator: ", ")
-            let overlayOpacityStart = (overlay.components[OpacityComponent.self]?.opacity ?? -1)
-            print(
-                "[PaintingCanvasEntity] Overlay entity created separately: name=\(overlay.name), " +
-                "localPosition=\(overlay.position), width=\(canvasWidth)m, height=\(canvasHeight)m, " +
-                "overlayZOffset=\(overlayZOffset), materialTypes=[\(overlayMatTypes)]" +
-                ", opacityComponentStart=\(overlayOpacityStart)"
-            )
-            print("[PaintingCanvasEntity] Overlay initial state should be fully transparent (opacityComponentStart ~ 0).")
-        }
-
-        return PaintingCanvasResult(root: root, overlayEntity: overlay, regions: resolvedRegions)
+        return PaintingCanvasResult(root: root, regions: resolvedRegions)
     }
 
     private static func makeTexturedPlane(

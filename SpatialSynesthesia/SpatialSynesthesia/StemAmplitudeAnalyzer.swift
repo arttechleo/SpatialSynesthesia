@@ -22,7 +22,7 @@ final class StemAmplitudeAnalyzer {
     let sustainedAttackSpeed: Float = 4.0
     let releaseSpeed: Float = 5.0
     let categoryChangePunch: Float = 0.35
-    let minimumActiveEnergy: Float = 0.15
+    let minimumActiveEnergy: Float = 0.30
     let minimumDominantDuration: Float = 1.2
 
     var forceTransientOnNextUpdate: Bool = false
